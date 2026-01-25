@@ -91,9 +91,9 @@ def setup_optimizers(model: GPT, config: TrainConfig, ddp: bool = False):
 
     # Separate parameters
     matrix_params = list(model.transformer.h.parameters())
-    value_embeds_params = list(model.value_embeds.parameters())
+    value_embeds_params = list(model.value_embeds.parameters()) if model.value_embeds else []
     embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
+    lm_head_params = list(model.lm_head.parameters()) if model.lm_head is not None else []
     resid_params = [model.resid_lambdas]
     x0_params = [model.x0_lambdas]
 
@@ -103,12 +103,16 @@ def setup_optimizers(model: GPT, config: TrainConfig, ddp: bool = False):
 
     # AdamW for embeddings and scalars
     adam_groups = [
-        dict(params=lm_head_params, lr=config.adamw_unembedding_lr * dmodel_lr_scale),
         dict(params=embedding_params, lr=config.adamw_embedding_lr * dmodel_lr_scale),
-        dict(params=value_embeds_params, lr=config.adamw_embedding_lr * dmodel_lr_scale),
         dict(params=resid_params, lr=config.adamw_scalar_lr * 0.01),
         dict(params=x0_params, lr=config.adamw_scalar_lr, betas=(0.96, 0.95)),
     ]
+    # Only add lm_head params if not tied
+    if lm_head_params:
+        adam_groups.insert(0, dict(params=lm_head_params, lr=config.adamw_unembedding_lr * dmodel_lr_scale))
+    # Only add value_embeds params if they exist
+    if value_embeds_params:
+        adam_groups.append(dict(params=value_embeds_params, lr=config.adamw_embedding_lr * dmodel_lr_scale))
     adamw_optimizer = torch.optim.AdamW(
         adam_groups,
         betas=config.adam_betas,
@@ -228,8 +232,17 @@ def train(args):
         use_wandb=args.wandb and is_main,
     )
 
+    # Override batch_size if provided
+    if args.batch_size is not None:
+        train_config.batch_size = args.batch_size
+
+    # Override compile if --no_compile
+    if args.no_compile:
+        train_config.compile_model = False
+
     print0(f"Model config: {model_config}")
     print0(f"Training for {train_config.total_tokens:,} tokens")
+    print0(f"Batch size: {train_config.batch_size} x {train_config.gradient_accumulation_steps} = {train_config.batch_size * train_config.gradient_accumulation_steps}")
     print0(f"Total steps: {train_config.total_steps:,}")
 
     # Initialize wandb
@@ -350,9 +363,12 @@ def train(args):
             tokens_per_sec = tokens_seen / elapsed
             current_lr = adamw_opt.param_groups[0]["lr"]
 
+            # Average loss over log_interval steps (fix: was accumulating instead of averaging)
+            avg_loss = running_loss / max(1, train_config.log_interval if step > 0 else 1)
+
             log_msg = (
                 f"Step {step:>6d} | "
-                f"Loss {running_loss:.4f} | "
+                f"Loss {avg_loss:.4f} | "
                 f"LR {current_lr:.2e} | "
                 f"Tokens {tokens_seen/1e6:.1f}M | "
                 f"Speed {tokens_per_sec/1e3:.1f}K tok/s"
@@ -361,7 +377,7 @@ def train(args):
 
             if train_config.use_wandb:
                 wandb.log({
-                    "train/loss": running_loss,
+                    "train/loss": avg_loss,
                     "train/lr": current_lr,
                     "train/tokens": tokens_seen,
                     "train/tokens_per_sec": tokens_per_sec,
@@ -443,15 +459,15 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="25m",
-        choices=["25m", "40m", "50m"],
-        help="Model configuration",
+        default="22m",
+        choices=["22m", "36m", "45m"],
+        help="Model configuration (22m=~22M params, 36m=~36M, 45m=~45M)",
     )
     parser.add_argument(
         "--total_tokens",
         type=int,
-        default=500_000_000,
-        help="Total tokens to train on",
+        default=440_000_000,
+        help="Total tokens to train on (default: 440M for 22M model)",
     )
     parser.add_argument(
         "--checkpoint_dir",
@@ -469,6 +485,17 @@ def main():
         type=str,
         default=None,
         help="Path to checkpoint to resume from",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Override batch size (default: from config)",
+    )
+    parser.add_argument(
+        "--no_compile",
+        action="store_true",
+        help="Disable torch.compile (saves memory)",
     )
 
     args = parser.parse_args()

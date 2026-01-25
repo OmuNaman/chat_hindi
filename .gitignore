@@ -1,2 +1,4 @@
 venv/
 .claude/
+CLAUDE.md
+calc_params.py

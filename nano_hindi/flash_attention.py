@@ -41,6 +41,15 @@ _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 _override_impl = None
 
+# Check if enable_gqa is supported (PyTorch 2.5+)
+_SDPA_SUPPORTS_GQA = False
+try:
+    import inspect
+    sig = inspect.signature(F.scaled_dot_product_attention)
+    _SDPA_SUPPORTS_GQA = 'enable_gqa' in sig.parameters
+except Exception:
+    pass
+
 
 def _use_fa3():
     """Determine whether to use FA3 based on availability and override."""
@@ -52,23 +61,54 @@ def _use_fa3():
     return HAS_FA3
 
 
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _repeat_kv(x, n_rep):
+    """Repeat KV heads to match Q heads for GQA when enable_gqa not supported.
+
+    x: (B, H_kv, T, D) -> (B, H_kv * n_rep, T, D)
+    """
+    if n_rep == 1:
+        return x
+    B, H_kv, T, D = x.shape
+    x = x[:, :, None, :, :].expand(B, H_kv, n_rep, T, D)
+    return x.reshape(B, H_kv * n_rep, T, D)
+
+
+def _sdpa_attention(q, k, v, window_size, n_rep=1):
     """SDPA attention with sliding window support. q, k, v are (B, H, T, D)."""
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
 
+    # Handle GQA: either use enable_gqa or repeat KV heads
+    n_heads_q = q.size(1)
+    n_heads_kv = k.size(1)
+
+    if n_heads_q != n_heads_kv:
+        if _SDPA_SUPPORTS_GQA:
+            # Use native GQA support (PyTorch 2.5+)
+            enable_gqa = True
+        else:
+            # Manually repeat KV heads
+            n_rep = n_heads_q // n_heads_kv
+            k = _repeat_kv(k, n_rep)
+            v = _repeat_kv(v, n_rep)
+            enable_gqa = False
+    else:
+        enable_gqa = False
+
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=enable_gqa
-        )
+        if _SDPA_SUPPORTS_GQA and enable_gqa:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     # Single token generation
     if Tq == 1:
-        return F.scaled_dot_product_attention(
-            q, k, v, is_causal=False, enable_gqa=enable_gqa
-        )
+        if _SDPA_SUPPORTS_GQA and enable_gqa:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
+        else:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
     # Need explicit mask
     device = q.device
@@ -86,9 +126,10 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             torch.ones(Tq, Tq, device=device, dtype=torch.bool)
         )
 
-    return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, enable_gqa=enable_gqa
-    )
+    if _SDPA_SUPPORTS_GQA and enable_gqa:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+    else:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
 
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
@@ -110,8 +151,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    y = _sdpa_attention(q, k, v, window_size)
     return y.transpose(1, 2)
 
 
@@ -167,8 +207,7 @@ def flash_attn_with_kvcache(
     k_sdpa = k_full.transpose(1, 2)
     v_sdpa = v_full.transpose(1, 2)
 
-    enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size)
 
     return y_sdpa.transpose(1, 2)
 

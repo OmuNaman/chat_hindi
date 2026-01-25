@@ -36,8 +36,9 @@ def evaluate_bpb(model, batches, steps: int, token_bytes: torch.Tensor) -> float
     for _ in range(steps):
         x, y = next(batch_iter)
 
-        # Get per-token loss
-        loss2d = model(x, y, loss_reduction="none").view(-1)
+        # Get per-token loss (use autocast to match training dtype)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss2d = model(x, y, loss_reduction="none").view(-1).float()
         y = y.view(-1)
 
         # Handle ignored tokens (target < 0)
@@ -127,8 +128,10 @@ def evaluate_loss(model, batches, steps: int) -> float:
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        loss = model(x, y, loss_reduction="sum")
-        total_loss += loss
+        # Use autocast to match training dtype (model has bf16 embeddings)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = model(x, y, loss_reduction="sum")
+        total_loss += loss.float()
         total_tokens += (y != -1).sum()
 
     # All-reduce
