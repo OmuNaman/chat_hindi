@@ -19,7 +19,7 @@ from nano_hindi.model import GPT
 def load_model(checkpoint_path: str, device: str = "cuda"):
     """Load model from checkpoint."""
     print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Reconstruct config
     config_dict = checkpoint["model_config"]
@@ -27,9 +27,18 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
 
     print(f"Model config: {config}")
 
-    # Create and load model
+    # Create model
     model = GPT(config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Handle torch.compile prefix (_orig_mod.) in state dict
+    state_dict = checkpoint["model_state_dict"]
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        # Strip _orig_mod. prefix if present (from torch.compile)
+        new_key = key.replace("_orig_mod.", "")
+        new_state_dict[new_key] = value
+
+    model.load_state_dict(new_state_dict)
     model.eval()
 
     print(f"Loaded from step {checkpoint['step']}, tokens seen: {checkpoint['tokens_seen']:,}")
