@@ -1,21 +1,19 @@
 """
 GPT model for nano_hindi.
 
-Architecture features (from modded-nanogpt):
+Architecture features:
 - Rotary embeddings (RoPE)
 - QK normalization
-- Untied weights for token embedding and lm_head
 - ReLU^2 activation in MLP
 - RMSNorm (no learnable params)
 - No bias in linear layers
 - Group-Query Attention (GQA)
 - Sliding window attention
-- Value embeddings (ResFormer-style)
+- Optional: Tied embeddings (wte = lm_head)
+- Optional: Value embeddings (ResFormer-style)
 - Per-layer scalars (resid_lambdas, x0_lambdas)
 """
 
-from functools import partial
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -23,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import GPTConfig
-from .common import get_dist_info, print0
+from .common import print0
 from .flash_attention import flash_attn
 
 
@@ -57,6 +55,7 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = config.head_dim
+        self.use_value_embeds = config.use_value_embeds
 
         # Query, Key, Value projections
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -64,13 +63,11 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-        # Value embedding gate (for layers that use VE)
+        # Value embedding gate (only for layers that use VE and when VE is enabled)
         self.ve_gate_channels = 32
-        self.ve_gate = (
-            nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
-            if has_ve(layer_idx, config.n_layer)
-            else None
-        )
+        self.ve_gate = None
+        if self.use_value_embeds and has_ve(layer_idx, config.n_layer):
+            self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
 
     def forward(
         self,
@@ -107,11 +104,8 @@ class CausalSelfAttention(nn.Module):
         else:
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                k=k,
-                v=v,
+                q, k_cache, v_cache,
+                k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
                 window_size=window_size,
@@ -172,42 +166,39 @@ class GPT(nn.Module):
         self.window_sizes = self._compute_window_sizes(config)
 
         # Pad vocab for efficiency
-        padded_vocab_size = (
+        self.padded_vocab_size = (
             (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to
         ) * pad_vocab_size_to
-        if padded_vocab_size != config.vocab_size:
-            print0(f"Padding vocab from {config.vocab_size} to {padded_vocab_size}")
+        if self.padded_vocab_size != config.vocab_size:
+            print0(f"Padding vocab from {config.vocab_size} to {self.padded_vocab_size}")
 
-        # Model components
-        self.transformer = nn.ModuleDict(
-            {
-                "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-                "h": nn.ModuleList(
-                    [Block(config, i) for i in range(config.n_layer)]
-                ),
-            }
-        )
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Token embedding
+        self.transformer = nn.ModuleDict({
+            "wte": nn.Embedding(self.padded_vocab_size, config.n_embd),
+            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+        })
+
+        # LM head - either tied to wte or separate
+        if config.tie_embeddings:
+            self.lm_head = None  # Will use wte.weight.T in forward
+        else:
+            self.lm_head = nn.Linear(config.n_embd, self.padded_vocab_size, bias=False)
 
         # Per-layer scalars
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
 
-        # Value embeddings (alternating layers)
-        kv_dim = config.n_kv_head * config.head_dim
-        self.value_embeds = nn.ModuleDict(
-            {
-                str(i): nn.Embedding(padded_vocab_size, kv_dim)
-                for i in range(config.n_layer)
-                if has_ve(i, config.n_layer)
-            }
-        )
+        # Value embeddings (only if enabled)
+        self.value_embeds = nn.ModuleDict()
+        if config.use_value_embeds:
+            kv_dim = config.n_kv_head * config.head_dim
+            for i in range(config.n_layer):
+                if has_ve(i, config.n_layer):
+                    self.value_embeds[str(i)] = nn.Embedding(self.padded_vocab_size, kv_dim)
 
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(
-            self.rotary_seq_len, config.head_dim
-        )
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, config.head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -220,8 +211,9 @@ class GPT(nn.Module):
         # Token embedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
 
-        # LM head
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # LM head (only if not tied)
+        if self.lm_head is not None:
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks
         for block in self.transformer.h:
@@ -243,9 +235,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Rotary embeddings
-        cos, sin = self._precompute_rotary_embeddings(
-            self.rotary_seq_len, self.config.head_dim
-        )
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.config.head_dim)
         self.cos.copy_(cos)
         self.sin.copy_(sin)
 
@@ -323,11 +313,18 @@ class GPT(nn.Module):
 
         x = norm(x)
 
-        # Compute logits with softcap
-        softcap = 15
-        logits = self.lm_head(x)
+        # Compute logits
+        if self.lm_head is not None:
+            # Untied: use separate lm_head
+            logits = self.lm_head(x)
+        else:
+            # Tied: use wte.weight transposed
+            logits = F.linear(x, self.transformer.wte.weight)
+
+        # Slice to actual vocab size and apply softcap
         logits = logits[..., : self.config.vocab_size]
         logits = logits.float()
+        softcap = 15
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
@@ -360,7 +357,9 @@ class GPT(nn.Module):
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
 
         for _ in range(max_tokens):
-            logits = self.forward(ids)
+            # Use autocast for bf16 embeddings
+            with torch.autocast(device_type=device.type if hasattr(device, 'type') else 'cuda', dtype=torch.bfloat16):
+                logits = self.forward(ids)
             logits = logits[:, -1, :]
 
             if top_k is not None:
