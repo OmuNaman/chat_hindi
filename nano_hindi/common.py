@@ -34,6 +34,13 @@ def setup_distributed():
     if ddp:
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
+
+    # Performance settings for H100 / modern GPUs
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     return ddp, rank, local_rank, world_size
 
 
