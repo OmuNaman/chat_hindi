@@ -14,7 +14,7 @@ Usage:
     python train.py --config 250m --total_tokens 5000000000 --wandb
 
     # 2×H100 with DDP
-    torchrun --nproc_per_node=2 train.py --config 250m --total_tokens 5000000000 --batch_size 64 --wandb
+    torchrun --nproc_per_node=2 train.py --config 250m --total_tokens 5000000000 --batch_size 32 --wandb
 """
 
 import argparse
@@ -36,6 +36,7 @@ from nano_hindi.model import GPT
 from nano_hindi.muon import Muon, DistMuon
 from nano_hindi.eval import evaluate_loss, compute_token_bytes
 from nano_hindi.common import setup_distributed, cleanup_distributed, print0
+import torch.distributed as dist
 
 
 class DataLoader:
@@ -503,39 +504,44 @@ def train(args):
             last_avg_loss = avg_loss
             running_loss = 0.0
 
-        # Evaluation
-        if step % train_config.eval_interval == 0 and step > 0 and is_main:
+        # Evaluation — ALL ranks must participate (evaluate_loss has all_reduce)
+        if step % train_config.eval_interval == 0 and step > 0:
             eval_model = model.module if ddp else model
             if hasattr(eval_model, "_orig_mod"):
                 eval_model = eval_model._orig_mod
             val_loss = evaluate_loss(eval_model, val_loader, steps=20)
             model.train()  # Restore train mode (evaluate_loss sets eval mode)
-            print(f"  Val loss: {val_loss:.4f}")
 
-            if train_config.use_wandb:
-                wandb.log({"val/loss": val_loss, "train/step": step})
+            if is_main:
+                print(f"  Val loss: {val_loss:.4f}")
+                if train_config.use_wandb:
+                    wandb.log({"val/loss": val_loss, "train/step": step})
 
-        # Inference samples
-        if step % train_config.inference_interval == 0 and step > 0 and is_main:
-            print("\n--- Inference Samples ---")
-            samples = run_inference(
-                model,
-                tokenizer,
-                train_config.inference_prompts,
-                max_tokens=train_config.inference_max_tokens,
-            )
-            for prompt, output in samples:
-                print(f"Prompt: {prompt}")
-                print(f"Output: {output}")
-                print()
-
-            if train_config.use_wandb:
-                table = wandb.Table(columns=["prompt", "output"])
+        # Inference samples — only rank 0 generates, but all ranks must sync
+        if step % train_config.inference_interval == 0 and step > 0:
+            if is_main:
+                print("\n--- Inference Samples ---")
+                samples = run_inference(
+                    model,
+                    tokenizer,
+                    train_config.inference_prompts,
+                    max_tokens=train_config.inference_max_tokens,
+                )
                 for prompt, output in samples:
-                    table.add_data(prompt, output)
-                wandb.log({"inference/samples": table, "train/step": step})
+                    print(f"Prompt: {prompt}")
+                    print(f"Output: {output}")
+                    print()
 
-            print("-------------------------\n")
+                if train_config.use_wandb:
+                    table = wandb.Table(columns=["prompt", "output"])
+                    for prompt, output in samples:
+                        table.add_data(prompt, output)
+                    wandb.log({"inference/samples": table, "train/step": step})
+
+                print("-------------------------\n")
+
+            if ddp:
+                dist.barrier()  # Sync all ranks after inference
 
         # Checkpointing (async save)
         if step % train_config.checkpoint_interval == 0 and step > 0 and is_main:
