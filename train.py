@@ -69,7 +69,7 @@ class DataLoader:
         # Vectorized: gather all sequences at once
         offsets = np.arange(self.seq_len + 1)  # [0, 1, ..., seq_len]
         indices = ix[:, None] + offsets[None, :]  # (batch, seq_len+1)
-        chunks = self.data[indices].astype(np.int64)  # (batch, seq_len+1)
+        chunks = self.data[indices]  # uint32, no int64 cast on CPU
         x = torch.from_numpy(chunks[:, :-1].copy()).pin_memory()
         y = torch.from_numpy(chunks[:, 1:].copy()).pin_memory()
         return x, y
@@ -110,10 +110,10 @@ class DataLoader:
             except Exception:
                 # Prefetch thread may have died; fallback to sync
                 x, y = self._make_batch()
-            return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            return x.to(self.device, dtype=torch.long, non_blocking=True), y.to(self.device, dtype=torch.long, non_blocking=True)
         else:
             x, y = self._make_batch()
-            return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            return x.to(self.device, dtype=torch.long, non_blocking=True), y.to(self.device, dtype=torch.long, non_blocking=True)
 
     def __iter__(self):
         while True:
@@ -429,6 +429,7 @@ def train(args):
 
     train_iter = iter(train_loader)
 
+    step_start = time.time()
     for step in range(start_step, total_steps):
         # Update learning rate
         lr_mult = get_lr_schedule(
@@ -473,10 +474,15 @@ def train(args):
         adamw_opt.zero_grad(set_to_none=True)  # set_to_none=True saves memory
         muon_opt.zero_grad(set_to_none=True)
 
+        # Measure step time
+        step_dt = time.time() - step_start
+        step_start = time.time()
+
         # Logging
         if step % train_config.log_interval == 0 and is_main:
             elapsed = time.time() - start_time
             tokens_per_sec = tokens_seen / elapsed
+            inst_tok_s = tokens_per_step / step_dt  # Instantaneous speed (this step only)
             current_lr = adamw_opt.param_groups[0]["lr"]
 
             avg_loss = running_loss / max(1, train_config.log_interval if step > 0 else 1)
@@ -486,7 +492,9 @@ def train(args):
                 f"Loss {avg_loss:.4f} | "
                 f"LR {current_lr:.2e} | "
                 f"Tokens {tokens_seen/1e9:.3f}B | "
-                f"Speed {tokens_per_sec/1e3:.1f}K tok/s | "
+                f"Speed {inst_tok_s/1e3:.0f}K tok/s | "
+                f"Avg {tokens_per_sec/1e3:.0f}K tok/s | "
+                f"Step {step_dt:.2f}s | "
                 f"GPU mem {torch.cuda.max_memory_allocated()/1e9:.1f}GB"
             )
             print(log_msg)
@@ -496,7 +504,9 @@ def train(args):
                     "train/loss": avg_loss,
                     "train/lr": current_lr,
                     "train/tokens": tokens_seen,
-                    "train/tokens_per_sec": tokens_per_sec,
+                    "train/tokens_per_sec": inst_tok_s,
+                    "train/avg_tokens_per_sec": tokens_per_sec,
+                    "train/step_time": step_dt,
                     "train/step": step,
                     "train/gpu_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
                 })
