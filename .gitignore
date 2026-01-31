@@ -2,4 +2,6 @@ venv/
 .claude/
 CLAUDE.md
 calc_params.py
+calc_params_250m.py
 MODEL_ARCHITECTURE.md
+__pycache__/

@@ -460,8 +460,8 @@ def main():
         "--config",
         type=str,
         default="22m",
-        choices=["22m", "36m", "45m"],
-        help="Model configuration (22m=~22M params, 36m=~36M, 45m=~45M)",
+        choices=["22m", "36m", "45m", "250m"],
+        help="Model configuration (22m=~22M, 36m=~36M, 45m=~45M, 250m=~250M)",
     )
     parser.add_argument(
         "--total_tokens",
