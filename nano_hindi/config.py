@@ -4,7 +4,8 @@ Configuration classes for nano_hindi model and training.
 Model sizes (with 68K Sarvam vocab):
 - 22m: 6 layers, 256 dim, tied embeddings, no value embeds
 - 36m: 6 layers, 384 dim, tied embeddings, no value embeds
-- 45m: 8 layers, 384 dim, tied embeddings, with value embeds
+- 45m: 8 layers, 384 dim, tied embeddings, no value embeds
+- 250m: 32 layers, 768 dim, tied embeddings, no value embeds
 
 Chinchilla scaling: tokens = 20 * params
 """
@@ -174,12 +175,21 @@ CONFIGS = {
         tie_embeddings=True,
         use_value_embeds=False,
     ),
-    # ~45M params - with value embeddings
+    # ~45M params - deeper variant
     "45m": GPTConfig(
         n_layer=8,
         n_head=6,
         n_kv_head=2,
         n_embd=384,
+        tie_embeddings=True,
+        use_value_embeds=False,
+    ),
+    # ~250M params - scaled up for 8×H100 training
+    "250m": GPTConfig(
+        n_layer=32,
+        n_head=12,
+        n_kv_head=4,
+        n_embd=768,
         tie_embeddings=True,
         use_value_embeds=False,
     ),
