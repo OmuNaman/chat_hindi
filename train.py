@@ -23,7 +23,6 @@ import time
 import threading
 from contextlib import nullcontext
 from pathlib import Path
-from functools import partial
 from queue import Queue
 
 import numpy as np
@@ -58,42 +57,31 @@ class DataLoader:
         self.n_tokens = len(self.data)
         self.prefetch_batches = prefetch_batches
 
-        # Pre-allocate pinned memory buffers for zero-copy transfers
-        self._pin_buffers = [
-            (
-                torch.empty(batch_size, seq_len, dtype=torch.int64, pin_memory=True),
-                torch.empty(batch_size, seq_len, dtype=torch.int64, pin_memory=True),
-            )
-            for _ in range(prefetch_batches)
-        ]
-        self._buf_idx = 0
-
-        # Prefetch queue
+        # Prefetch queue holds independent tensors (no buffer reuse race)
         self._queue = Queue(maxsize=prefetch_batches)
         self._stop = threading.Event()
         self._thread = None
 
-    def _fill_batch(self, x_buf, y_buf):
-        """Fill pre-allocated pinned buffers with a random batch."""
-        ix = torch.randint(self.n_tokens - self.seq_len - 1, (self.batch_size,))
-        for j, i in enumerate(ix):
-            chunk = self.data[i : i + self.seq_len + 1].astype(np.int64)
-            x_buf[j].copy_(torch.from_numpy(chunk[:-1]))
-            y_buf[j].copy_(torch.from_numpy(chunk[1:]))
-        return x_buf, y_buf
+    def _make_batch(self):
+        """Create a batch in pinned memory using vectorized numpy ops."""
+        ix = np.random.randint(0, self.n_tokens - self.seq_len - 1, size=self.batch_size)
+        # Vectorized: gather all sequences at once
+        offsets = np.arange(self.seq_len + 1)  # [0, 1, ..., seq_len]
+        indices = ix[:, None] + offsets[None, :]  # (batch, seq_len+1)
+        chunks = self.data[indices].astype(np.int64)  # (batch, seq_len+1)
+        x = torch.from_numpy(chunks[:, :-1].copy()).pin_memory()
+        y = torch.from_numpy(chunks[:, 1:].copy()).pin_memory()
+        return x, y
 
     def _prefetch_loop(self):
-        """Background thread that prefetches batches into pinned memory."""
-        buf_idx = 0
+        """Background thread that prefetches batches into fresh pinned tensors."""
         while not self._stop.is_set():
-            x_buf, y_buf = self._pin_buffers[buf_idx % self.prefetch_batches]
-            self._fill_batch(x_buf, y_buf)
+            x, y = self._make_batch()
             try:
-                self._queue.put((x_buf, y_buf), timeout=1.0)
+                self._queue.put((x, y), timeout=1.0)
             except Exception:
                 if self._stop.is_set():
                     break
-            buf_idx += 1
 
     def start_prefetch(self):
         """Start the background prefetch thread."""
@@ -107,7 +95,6 @@ class DataLoader:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
-        # Drain queue
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -117,16 +104,15 @@ class DataLoader:
     def get_batch(self):
         """Get a batch, using prefetched data if available."""
         if self._thread is not None and self._thread.is_alive():
-            x_buf, y_buf = self._queue.get()
-            # Non-blocking transfer from pinned memory to GPU
-            x = x_buf.to(self.device, non_blocking=True)
-            y = y_buf.to(self.device, non_blocking=True)
-            return x, y
+            try:
+                x, y = self._queue.get(timeout=10.0)
+            except Exception:
+                # Prefetch thread may have died; fallback to sync
+                x, y = self._make_batch()
+            return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
         else:
-            # Fallback: synchronous loading
-            x_buf, y_buf = self._pin_buffers[0]
-            self._fill_batch(x_buf, y_buf)
-            return x_buf.to(self.device, non_blocking=True), y_buf.to(self.device, non_blocking=True)
+            x, y = self._make_batch()
+            return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
     def __iter__(self):
         while True:
@@ -135,7 +121,7 @@ class DataLoader:
 
 def get_lr_schedule(step: int, warmup_steps: int, total_steps: int, min_lr_ratio: float):
     """Cosine learning rate schedule with warmup."""
-    if step < warmup_steps:
+    if warmup_steps > 0 and step < warmup_steps:
         return step / warmup_steps
     if step >= total_steps:
         return min_lr_ratio
@@ -197,6 +183,21 @@ def setup_optimizers(model: GPT, config: TrainConfig, ddp: bool = False):
     return adamw_optimizer, muon_optimizer
 
 
+def _state_dict_to_cpu(state_dict):
+    """Recursively move all tensors in a state dict to CPU."""
+    result = {}
+    for k, v in state_dict.items():
+        if torch.is_tensor(v):
+            result[k] = v.detach().cpu()
+        elif isinstance(v, dict):
+            result[k] = _state_dict_to_cpu(v)
+        elif isinstance(v, list):
+            result[k] = [t.detach().cpu() if torch.is_tensor(t) else t for t in v]
+        else:
+            result[k] = v
+    return result
+
+
 def save_checkpoint(
     model: nn.Module,
     adamw_opt,
@@ -211,17 +212,18 @@ def save_checkpoint(
     checkpoint_dir = Path(config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Gather checkpoint data on main thread (state_dict must be on CPU)
+    # Move ALL state to CPU before handing off to background thread
+    # (touching CUDA tensors from a non-main thread can cause random crashes)
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
     checkpoint = {
         "step": step,
         "tokens_seen": tokens_seen,
         "loss": loss,
-        "model_state_dict": {
-            k: v.cpu() for k, v in
-            (model.module.state_dict() if hasattr(model, "module") else model.state_dict()).items()
-        },
-        "adamw_optimizer": adamw_opt.state_dict(),
-        "muon_optimizer": muon_opt.state_dict(),
+        "model_state_dict": {k: v.cpu() for k, v in raw_model.state_dict().items()},
+        "adamw_optimizer": _state_dict_to_cpu(adamw_opt.state_dict()),
+        "muon_optimizer": _state_dict_to_cpu(muon_opt.state_dict()),
         "model_config": model_config.__dict__,
         "train_config": config.__dict__,
     }
@@ -229,7 +231,10 @@ def save_checkpoint(
     checkpoint_path = checkpoint_dir / f"checkpoint_step{step}.pt"
 
     def _save():
-        torch.save(checkpoint, checkpoint_path)
+        # Atomic write: save to temp file, then rename
+        tmp_path = checkpoint_path.with_suffix(".tmp")
+        torch.save(checkpoint, tmp_path)
+        tmp_path.rename(checkpoint_path)
         # Clean up old checkpoints
         checkpoints = sorted(checkpoint_dir.glob("checkpoint_step*.pt"))
         if len(checkpoints) > config.keep_last_n_checkpoints:
@@ -260,6 +265,8 @@ def load_checkpoint(checkpoint_path: str, model: nn.Module, adamw_opt, muon_opt,
 def run_inference(model: nn.Module, tokenizer, prompts: list, max_tokens: int = 50, temperature: float = 0.8):
     """Generate text samples for monitoring during training."""
     model_to_use = model.module if hasattr(model, "module") else model
+    if hasattr(model_to_use, "_orig_mod"):
+        model_to_use = model_to_use._orig_mod
     model_to_use.eval()
 
     results = []
@@ -289,7 +296,14 @@ def train(args):
 
     # Device setup
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
-    torch.cuda.set_device(device) if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    # Per-rank seeding so each GPU samples different data
+    seed = 1337 + rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
     # Load configs
     model_config = get_config(args.config)
@@ -307,14 +321,21 @@ def train(args):
     if args.no_compile:
         train_config.compile_model = False
 
-    # Adjust effective batch for multi-GPU
-    effective_batch = train_config.batch_size * train_config.gradient_accumulation_steps * world_size
+    # Compute total_steps accounting for world_size
+    # (TrainConfig.total_steps ignores world_size, so we compute it here)
+    tokens_per_step = (
+        train_config.batch_size
+        * train_config.gradient_accumulation_steps
+        * world_size
+        * model_config.sequence_len
+    )
+    total_steps = train_config.total_tokens // tokens_per_step
 
     print0(f"Model config: {model_config}")
     print0(f"Training for {train_config.total_tokens:,} tokens")
-    print0(f"Batch size: {train_config.batch_size} x {train_config.gradient_accumulation_steps} x {world_size} GPUs = {effective_batch} sequences/step")
-    print0(f"Tokens per step: {effective_batch * model_config.sequence_len:,}")
-    print0(f"Total steps: {train_config.total_steps:,}")
+    print0(f"Batch size: {train_config.batch_size} x {train_config.gradient_accumulation_steps} x {world_size} GPUs = {train_config.batch_size * train_config.gradient_accumulation_steps * world_size} sequences/step")
+    print0(f"Tokens per step: {tokens_per_step:,}")
+    print0(f"Total steps: {total_steps:,}")
 
     # Initialize wandb
     if train_config.use_wandb:
@@ -329,9 +350,11 @@ def train(args):
             },
         )
 
-    # Load tokenizer
-    print0("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("sarvamai/sarvam-1")
+    # Load tokenizer (only rank 0 needs it for inference samples)
+    tokenizer = None
+    if is_main:
+        print0("Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("sarvamai/sarvam-1")
 
     # Create model
     print0("Creating model...")
@@ -339,21 +362,17 @@ def train(args):
     model.init_weights()
     print0(f"Model parameters: {model.num_params():,}")
 
-    # Wrap in DDP first, then compile (better for torch.compile + DDP)
-    if ddp:
-        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
+    # Setup optimizers on raw model BEFORE compile/DDP wrapping
+    adamw_opt, muon_opt = setup_optimizers(model, train_config, ddp=ddp)
 
-    # Compile model with max-autotune for H100
+    # Compile FIRST, then wrap in DDP
+    # (compile after DDP breaks no_sync() and state_dict on PyTorch 2.4)
     if train_config.compile_model and torch.cuda.is_available():
         print0("Compiling model with torch.compile (max-autotune)...")
         model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
-    # Setup optimizers
-    raw_model = model.module if ddp else model
-    # Unwrap compiled model if needed
-    if hasattr(raw_model, "_orig_mod"):
-        raw_model = raw_model._orig_mod
-    adamw_opt, muon_opt = setup_optimizers(raw_model, train_config, ddp=ddp)
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
 
     # Cache all parameters for fast grad clipping (avoid re-iterating every step)
     all_params = [p for p in model.parameters() if p.requires_grad]
@@ -403,19 +422,18 @@ def train(args):
 
     micro_step = 0
     running_loss = 0.0
+    last_avg_loss = float("inf")
     start_time = time.time()
     ckpt_thread = None  # Track async checkpoint thread
 
     train_iter = iter(train_loader)
 
-    for step in range(start_step, train_config.total_steps):
-        step_start = time.time()
-
+    for step in range(start_step, total_steps):
         # Update learning rate
         lr_mult = get_lr_schedule(
             step,
             train_config.warmup_steps,
-            train_config.total_steps,
+            total_steps,
             train_config.min_lr_ratio,
         )
         for opt in [adamw_opt, muon_opt]:
@@ -423,6 +441,7 @@ def train(args):
                 group["lr"] = group["initial_lr"] * lr_mult
 
         # Gradient accumulation with DDP no_sync optimization
+        accumulated_loss = torch.zeros(1, device=device)
         for micro in range(train_config.gradient_accumulation_steps):
             x, y = next(train_iter)
 
@@ -437,9 +456,12 @@ def train(args):
 
                 loss.backward()
 
-            running_loss += loss.item()
+            accumulated_loss += loss.detach()  # Stay on GPU, no sync
             micro_step += 1
             tokens_seen += x.numel() * world_size  # Count across all GPUs
+
+        # Single GPU→CPU sync per optimizer step instead of per micro-step
+        running_loss += accumulated_loss.item()
 
         # Gradient clipping (using cached param list)
         nn.utils.clip_grad_norm_(all_params, 1.0)
@@ -455,12 +477,11 @@ def train(args):
             elapsed = time.time() - start_time
             tokens_per_sec = tokens_seen / elapsed
             current_lr = adamw_opt.param_groups[0]["lr"]
-            step_time = time.time() - step_start
 
             avg_loss = running_loss / max(1, train_config.log_interval if step > 0 else 1)
 
             log_msg = (
-                f"Step {step:>6d}/{train_config.total_steps} | "
+                f"Step {step:>6d}/{total_steps} | "
                 f"Loss {avg_loss:.4f} | "
                 f"LR {current_lr:.2e} | "
                 f"Tokens {tokens_seen/1e9:.3f}B | "
@@ -479,6 +500,7 @@ def train(args):
                     "train/gpu_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
                 })
 
+            last_avg_loss = avg_loss
             running_loss = 0.0
 
         # Evaluation
@@ -487,6 +509,7 @@ def train(args):
             if hasattr(eval_model, "_orig_mod"):
                 eval_model = eval_model._orig_mod
             val_loss = evaluate_loss(eval_model, val_loader, steps=20)
+            model.train()  # Restore train mode (evaluate_loss sets eval mode)
             print(f"  Val loss: {val_loss:.4f}")
 
             if train_config.use_wandb:
@@ -525,7 +548,7 @@ def train(args):
                 muon_opt,
                 step,
                 tokens_seen,
-                running_loss,
+                last_avg_loss,
                 train_config,
                 model_config,
             )
@@ -541,9 +564,9 @@ def train(args):
             model,
             adamw_opt,
             muon_opt,
-            train_config.total_steps,
+            total_steps,
             tokens_seen,
-            running_loss,
+            last_avg_loss,
             train_config,
             model_config,
         )
@@ -585,12 +608,6 @@ def main():
         "--wandb",
         action="store_true",
         help="Enable wandb logging",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume from",
     )
     parser.add_argument(
         "--batch_size",
