@@ -251,10 +251,10 @@ def load_checkpoint(checkpoint_path: str, model: nn.Module, adamw_opt, muon_opt,
     """Load training checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    if hasattr(model, "module"):
-        model.module.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint["model_state_dict"])
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
+    raw_model.load_state_dict(checkpoint["model_state_dict"])
 
     adamw_opt.load_state_dict(checkpoint["adamw_optimizer"])
     muon_opt.load_state_dict(checkpoint["muon_optimizer"])
