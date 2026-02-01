@@ -170,10 +170,11 @@ def setup_sft_optimizers(model, ddp_mode):
     x0_params = [raw_model.x0_lambdas]
     value_embeds_params = list(raw_model.value_embeds.parameters()) if raw_model.value_embeds else []
 
+    # Scale scalar LRs from matrix_lr (not hardcoded pretraining values)
     adam_groups = [
         dict(params=embedding_params, lr=args.embedding_lr * dmodel_lr_scale, kind='adamw'),
-        dict(params=resid_params, lr=0.5 * 0.01, kind='adamw'),
-        dict(params=x0_params, lr=0.5, betas=(0.96, 0.95), kind='adamw'),
+        dict(params=resid_params, lr=args.matrix_lr * 0.01, kind='adamw'),
+        dict(params=x0_params, lr=args.matrix_lr, betas=(0.96, 0.95), kind='adamw'),
     ]
     if lm_head_params:
         adam_groups.insert(0, dict(params=lm_head_params, lr=args.unembedding_lr * dmodel_lr_scale, kind='adamw'))
