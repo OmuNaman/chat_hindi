@@ -58,7 +58,8 @@ parser.add_argument("--embedding-lr", type=float, default=0.2, help="LR for embe
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="LR for unembedding parameters (AdamW)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="LR for matrix parameters (Muon)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW")
-parser.add_argument("--init-lr-frac", type=float, default=1.0, help="Initial LR as fraction of base LR")
+parser.add_argument("--init-lr-frac", type=float, default=0.1, help="Initial LR as fraction of base LR")
+parser.add_argument("--warmup-steps", type=int, default=30, help="LR warmup steps (linear from init-lr-frac to 1.0)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=150, help="Evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=10_485_760, help="Tokens to evaluate val loss on (~10M)")
@@ -191,10 +192,9 @@ def setup_sft_optimizers(model, ddp_mode):
         weight_decay=args.weight_decay,
     )
 
-    # Store initial LRs + apply init-lr-frac
+    # Store initial LRs (warmup schedule handles init_lr_frac)
     for opt in [adamw_opt, muon_opt]:
         for group in opt.param_groups:
-            group["lr"] = group["lr"] * args.init_lr_frac
             group["initial_lr"] = group["lr"]
 
     return adamw_opt, muon_opt
@@ -340,7 +340,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
         mask_tensor = torch.tensor(row_masks, dtype=torch.long, pin_memory=use_cuda)
 
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda)
+        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.long, non_blocking=use_cuda)
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda)
         target_mask = mask_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda)
 
@@ -360,9 +360,17 @@ build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
 progress = 0.0
 
 
-# LR schedule: constant for 80%, then linear decay to 0
-def get_lr_multiplier(progress):
-    return 1.0 if progress < 0.8 else 1.0 - (progress - 0.8) / 0.2
+# LR schedule: warmup, then constant for 80%, then linear decay to 0
+def get_lr_multiplier(step, progress):
+    # Phase 1: Linear warmup from init_lr_frac to 1.0
+    if args.warmup_steps > 0 and step < args.warmup_steps:
+        warmup_frac = step / args.warmup_steps
+        return args.init_lr_frac + (1.0 - args.init_lr_frac) * warmup_frac
+    # Phase 2: Constant LR for 80% of training
+    if progress < 0.8:
+        return 1.0
+    # Phase 3: Linear decay to 0
+    return 1.0 - (progress - 0.8) / 0.2
 
 
 # Muon momentum warmup
@@ -442,7 +450,7 @@ while True:
         progress = max(progress, approx_progress)
 
     # LR schedule
-    lrm = get_lr_multiplier(progress)
+    lrm = get_lr_multiplier(step, progress)
     muon_momentum = get_muon_momentum(step)
     for group in adamw_opt.param_groups:
         group["lr"] = group["initial_lr"] * lrm
