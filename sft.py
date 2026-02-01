@@ -236,14 +236,8 @@ val_dataset = TaskMixture([
 print0(f"Train dataset: {len(train_dataset):,} conversations")
 print0(f"Val dataset: {len(val_dataset):,} conversations")
 
-# Estimate total steps
-if args.num_iterations > 0:
-    total_steps = args.num_iterations
-else:
-    # One full epoch: each conversation consumed once across all ranks
-    # Each step consumes device_batch_size * grad_accum_steps * world_size conversations (approx)
-    total_steps = len(train_dataset) // (args.device_batch_size * grad_accum_steps * world_size)
-print0(f"Total steps: {total_steps:,} ({'user-set' if args.num_iterations > 0 else 'estimated 1 epoch'})")
+total_steps = args.num_iterations if args.num_iterations > 0 else 0
+print0(f"Total steps: {total_steps if total_steps > 0 else '1 epoch (auto)'}")
 print0(f"Warmup steps: {args.warmup_steps}")
 
 # -----------------------------------------------------------------------------
@@ -383,9 +377,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100, yields_per_step=1):
             if args.num_iterations > 0:
                 approx_progress = step_count / args.num_iterations
             else:
-                approx_progress = consumed / dataset_size
-            if consumed >= dataset_size:
-                last_step = True
+                # No --num-iterations: run 1 full epoch
+                approx_progress = min(consumed / dataset_size, 1.0)
+                if epoch > 1:
+                    last_step = True
 
         # Build tensors
         use_cuda = torch.cuda.is_available()
@@ -522,16 +517,18 @@ while True:
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
 
-    # Evaluation
+    # Evaluation (quick 5% mid-training, full eval only on last step)
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * world_size)
-        eval_steps = max(eval_steps, 1)
+        full_eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * world_size)
+        full_eval_steps = max(full_eval_steps, 1)
+        eval_steps = full_eval_steps if last_step else max(full_eval_steps // 20, 1)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model if not ddp else model.module,
                                    val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        tag = "FULL" if last_step else "quick"
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f} ({tag}, {eval_steps} steps)")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({"step": step, "total_training_time": total_training_time, "val/bpb": val_bpb})
@@ -622,7 +619,7 @@ while True:
 
     if step % args.log_every == 0 or step == 1:
         print0(
-            f"Step {step:>6d}/{total_steps} ({pct_done:.1f}%) | "
+            f"Step {step:>6d}{f'/{total_steps}' if total_steps > 0 else ''} ({pct_done:.1f}%) | "
             f"Loss {debiased_loss:.4f} | LRM {lrm:.3f} | "
             f"Speed {tok_per_sec/1e3:.0f}K tok/s | "
             f"Step {dt:.2f}s | Epoch {current_epoch} | "
@@ -640,16 +637,18 @@ while True:
             "train/epoch": current_epoch,
         })
 
-    # Inference samples
-    if master_process and args.inference_every > 0 and step > 0 and step % args.inference_every == 0:
-        print0("\n--- SFT Inference Samples ---")
-        samples = run_sft_inference(model, tokenizer, SFT_INFERENCE_PROMPTS)
-        for prompt, response in samples:
-            print0(f"  Q: {prompt}")
-            print0(f"  A: {response[:300]}")
-            print0("")
-        print0("-----------------------------\n")
-        model.train()
+    # Inference samples (only master generates, but ALL ranks must hit barrier)
+    do_inference = args.inference_every > 0 and step > 0 and step % args.inference_every == 0
+    if do_inference:
+        if master_process:
+            print0("\n--- SFT Inference Samples ---")
+            samples = run_sft_inference(model, tokenizer, SFT_INFERENCE_PROMPTS)
+            for prompt, response in samples:
+                print0(f"  Q: {prompt}")
+                print0(f"  A: {response[:300]}")
+                print0("")
+            print0("-----------------------------\n")
+            model.train()
         if ddp:
             dist.barrier()
 
