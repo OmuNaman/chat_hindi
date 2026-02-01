@@ -63,6 +63,10 @@ parser.add_argument("--warmup-steps", type=int, default=30, help="LR warmup step
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=150, help="Evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=10_485_760, help="Tokens to evaluate val loss on (~10M)")
+# Logging & inference
+parser.add_argument("--log-every", type=int, default=10, help="Print training log every N steps")
+parser.add_argument("--inference-every", type=int, default=50, help="Generate inference samples every N steps (-1 = disable)")
+parser.add_argument("--checkpoint-every", type=int, default=200, help="Save checkpoint every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--checkpoint-dir", type=str, default="sft_checkpoints", help="Directory for SFT checkpoints")
 parser.add_argument("--dry-run", action="store_true", help="Log to wandb but skip checkpoints")
@@ -231,6 +235,16 @@ val_dataset = TaskMixture([
 print0(f"Train dataset: {len(train_dataset):,} conversations")
 print0(f"Val dataset: {len(val_dataset):,} conversations")
 
+# Estimate total steps
+if args.num_iterations > 0:
+    total_steps = args.num_iterations
+else:
+    # One full epoch: each conversation consumed once across all ranks
+    # Each step consumes device_batch_size * grad_accum_steps * world_size conversations (approx)
+    total_steps = len(train_dataset) // (args.device_batch_size * grad_accum_steps * world_size)
+print0(f"Total steps: {total_steps:,} ({'user-set' if args.num_iterations > 0 else 'estimated 1 epoch'})")
+print0(f"Warmup steps: {args.warmup_steps}")
+
 # -----------------------------------------------------------------------------
 # DataLoader: BOS-aligned bestfit packing (ported from nanochat)
 
@@ -380,10 +394,81 @@ def get_muon_momentum(it):
 
 
 # -----------------------------------------------------------------------------
+# Chat inference for monitoring during SFT
+SFT_INFERENCE_PROMPTS = [
+    "भारत की राजधानी क्या है?",
+    "तुम कौन हो?",
+    "मुझे पानी पूरी की रेसिपी बताओ।",
+]
+
+def run_sft_inference(model, tokenizer_obj, prompts, max_tokens=100, temperature=0.8):
+    """Generate chat-mode samples for monitoring SFT training."""
+    from nano_hindi.tokenizer import USER_MARKER, ASSISTANT_MARKER
+
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
+    raw_model.eval()
+
+    bos_id = tokenizer_obj.get_bos_token_id()
+    eos_id = tokenizer_obj.get_eos_token_id()
+    results = []
+
+    for prompt in prompts:
+        # Build chat context: BOS + user turn + assistant marker
+        context_text = USER_MARKER + prompt + "\n\n"
+        context_ids = [bos_id] + tokenizer_obj.encode(context_text, add_special_tokens=False)
+        marker_ids = tokenizer_obj.encode(ASSISTANT_MARKER, add_special_tokens=False)
+        context_ids.extend(marker_ids)
+
+        generated = []
+        with torch.autocast(device_type="cuda", dtype=ptdtype):
+            for token in raw_model.generate(
+                context_ids, max_tokens=max_tokens, temperature=temperature, top_k=50
+            ):
+                generated.append(token)
+                if token == eos_id:
+                    break
+
+        response = tokenizer_obj.decode(generated).replace("</s>", "").strip()
+        results.append((prompt, response))
+
+    raw_model.train()
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Checkpoint saving
+def save_sft_checkpoint(model, step, val_bpb=None):
+    """Save SFT checkpoint."""
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    ckpt_path = os.path.join(args.checkpoint_dir, f"sft_step{step}.pt")
+    raw_model = orig_model
+    ckpt = {
+        "step": step,
+        "model_state_dict": {k: v.cpu() for k, v in raw_model.state_dict().items()},
+        "model_config": model_config.__dict__,
+        "sft_config": vars(args),
+        "val_bpb": val_bpb,
+    }
+    print0(f"Saving SFT checkpoint: {ckpt_path}")
+    torch.save(ckpt, ckpt_path)
+
+    # Keep last 3 checkpoints
+    import glob as glob_mod
+    ckpts = sorted(glob_mod.glob(os.path.join(args.checkpoint_dir, "sft_step*.pt")))
+    while len(ckpts) > 3:
+        old = ckpts.pop(0)
+        os.remove(old)
+        print0(f"Removed old checkpoint: {old}")
+
+
+# -----------------------------------------------------------------------------
 # Training loop
 print0("Starting SFT training...")
 x, y = next(train_loader)
 min_val_bpb = float("inf")
+val_bpb = None
 smooth_train_loss = 0.0
 ema_beta = 0.9
 total_training_time = 0.0
@@ -411,21 +496,13 @@ while True:
         wandb_run.log({"step": step, "total_training_time": total_training_time, "val/bpb": val_bpb})
         model.train()
 
-    # Save checkpoint at end
-    if master_process and last_step and not args.dry_run:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-        ckpt_path = os.path.join(args.checkpoint_dir, f"sft_step{step}.pt")
-
-        raw_model = orig_model
-        ckpt = {
-            "step": step,
-            "model_state_dict": {k: v.cpu() for k, v in raw_model.state_dict().items()},
-            "model_config": model_config.__dict__,
-            "sft_config": vars(args),
-            "val_bpb": val_bpb if 'val_bpb' in dir() else None,
-        }
-        print0(f"Saving SFT checkpoint: {ckpt_path}")
-        torch.save(ckpt, ckpt_path)
+    # Periodic checkpoint saving
+    if master_process and not args.dry_run:
+        should_save = last_step
+        if not should_save and args.checkpoint_every > 0 and step > 0 and step % args.checkpoint_every == 0:
+            should_save = True
+        if should_save:
+            save_sft_checkpoint(model, step, val_bpb=val_bpb)
 
     if last_step:
         break
@@ -482,14 +559,16 @@ while True:
     if step > 10:
         total_training_time += dt
 
-    print0(
-        f"step {step:05d} ({pct_done:.2f}%) | "
-        f"loss: {debiased_loss:.6f} | lrm: {lrm:.2f} | "
-        f"dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | "
-        f"epoch: {current_epoch} | total time: {total_training_time / 60:.2f}m"
-    )
+    if step % args.log_every == 0 or step == 1:
+        print0(
+            f"Step {step:>6d}/{total_steps} ({pct_done:.1f}%) | "
+            f"Loss {debiased_loss:.4f} | LRM {lrm:.3f} | "
+            f"Speed {tok_per_sec/1e3:.0f}K tok/s | "
+            f"Step {dt:.2f}s | Epoch {current_epoch} | "
+            f"Time {total_training_time / 60:.1f}m"
+        )
 
-    if step % 10 == 0:
+    if step % args.log_every == 0:
         wandb_run.log({
             "step": step,
             "total_training_time": total_training_time,
@@ -499,6 +578,19 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/epoch": current_epoch,
         })
+
+    # Inference samples
+    if master_process and args.inference_every > 0 and step > 0 and step % args.inference_every == 0:
+        print0("\n--- SFT Inference Samples ---")
+        samples = run_sft_inference(model, tokenizer, SFT_INFERENCE_PROMPTS)
+        for prompt, response in samples:
+            print0(f"  Q: {prompt}")
+            print0(f"  A: {response[:300]}")
+            print0("")
+        print0("-----------------------------\n")
+        model.train()
+        if ddp:
+            dist.barrier()
 
 # Print final stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f} MiB")
