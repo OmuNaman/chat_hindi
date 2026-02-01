@@ -254,7 +254,7 @@ approx_progress = 0.0
 current_epoch = 1
 
 
-def sft_data_generator_bos_bestfit(split, buffer_size=100):
+def sft_data_generator_bos_bestfit(split, buffer_size=100, yields_per_step=1):
     """
     BOS-aligned dataloader for SFT with bestfit-pad packing.
 
@@ -262,6 +262,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     When no conversation fits, the row is padded (never cropped).
     Padding positions have targets masked with -1 (ignore_index).
     Additionally, non-assistant tokens are masked with -1 (only predict assistant).
+
+    yields_per_step: how many yields (micro-batches) per optimizer step.
+                     Used to correctly count iterations vs yields.
     """
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}
@@ -371,13 +374,14 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             continue
 
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
+        step_count = it // yields_per_step  # actual optimizer steps
+        if 0 < args.num_iterations <= step_count and split == "train":
             last_step = True
 
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
+                approx_progress = step_count / args.num_iterations
             else:
                 approx_progress = consumed / dataset_size
             if consumed >= dataset_size:
@@ -406,7 +410,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         yield inputs, targets
 
 
-train_loader = sft_data_generator_bos_bestfit("train")
+train_loader = sft_data_generator_bos_bestfit("train", yields_per_step=grad_accum_steps)
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
 progress = 0.0
 
