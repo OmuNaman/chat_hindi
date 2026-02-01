@@ -277,17 +277,36 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     epoch = 1
     it = 0
     step_size = world_size if ddp else 1
+    skipped_long = 0
+    skipped_no_label = 0
 
     def refill_buffer():
-        nonlocal cursor, epoch
-        while len(conv_buffer) < buffer_size:
+        nonlocal cursor, epoch, skipped_long, skipped_no_label
+        max_attempts = buffer_size * 50
+        attempts = 0
+        while len(conv_buffer) < buffer_size and attempts < max_attempts:
             conversation = dataset[cursor % dataset_size]
             ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
             cursor += step_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
                 epoch += 1
+            attempts += 1
+            # Skip conversations that can never fit in a row
+            if len(ids) > row_capacity:
+                skipped_long += 1
+                continue
+            # Skip conversations with zero assistant tokens (nothing to learn)
+            if not any(m == 1 for m in mask):
+                skipped_no_label += 1
+                continue
+            conv_buffer.append((ids, mask))
+        if len(conv_buffer) == 0 and attempts >= max_attempts:
+            raise RuntimeError(
+                f"No valid conversations found after {attempts} attempts. "
+                f"Skipped {skipped_long} too-long (>{row_capacity} tokens) "
+                f"and {skipped_no_label} with zero assistant tokens."
+            )
 
     while True:
         rows = []
@@ -297,11 +316,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for _ in range(args.device_batch_size):
             row = []
             row_mask = []
-            padded = False
 
             while len(row) < row_capacity:
-                while len(conv_buffer) < buffer_size:
+                if len(conv_buffer) < buffer_size:
                     refill_buffer()
+                if not conv_buffer:
+                    break
 
                 remaining = row_capacity - len(row)
 
@@ -319,23 +339,36 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     row.extend(ids)
                     row_mask.extend(mask)
                     consumed += step_size
+                elif len(row) == 0:
+                    # Row is empty but nothing fits - buffer is stale, flush and retry
+                    conv_buffer.clear()
+                    refill_buffer()
+                    continue
                 else:
-                    # No conversation fits - pad remainder
-                    content_len = len(row)
-                    pad_len = remaining
-                    bos_id = tokenizer.get_bos_token_id()
-                    row.extend([bos_id] * pad_len)
-                    row_mask.extend([0] * pad_len)  # padding is not predicted
-                    padded = True
-                    break
+                    break  # No conversation fits remaining space
 
-            if padded:
-                row_lengths.append(content_len)
-            else:
-                row_lengths.append(row_capacity)
+            # Record content length, then pad any remaining space
+            content_len = len(row)
+            if content_len < row_capacity:
+                pad_len = row_capacity - content_len
+                bos_id = tokenizer.get_bos_token_id()
+                row.extend([bos_id] * pad_len)
+                row_mask.extend([0] * pad_len)
 
+            row_lengths.append(content_len)
             rows.append(row[:row_capacity])
             row_masks.append(row_mask[:row_capacity])
+
+        # Safety: skip batches with zero valid targets (all padding)
+        has_valid = any(
+            any(m == 1 for m in row_masks[i][1:])
+            for i in range(len(rows))
+        )
+        if not has_valid:
+            # Log once
+            if skipped_long > 0 and it == 0:
+                print0(f"Warning: skipped {skipped_long} conversations longer than {row_capacity} tokens")
+            continue
 
         it += 1
         if 0 < args.num_iterations <= it and split == "train":
@@ -366,6 +399,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len - 1:] = -1
+
+        if it == 1 and (skipped_long > 0 or skipped_no_label > 0):
+            print0(f"Packing stats: {skipped_long} too-long, {skipped_no_label} no-label conversations skipped")
 
         yield inputs, targets
 
@@ -517,23 +553,23 @@ while True:
         is_last_micro = (micro_step == grad_accum_steps - 1)
         sync_ctx = nullcontext() if is_last_micro else no_sync_ctx()
 
+        # Pre-forward guard: skip micro-batches with zero valid targets
+        if (y != -1).sum().item() == 0:
+            print0(f"Skipping empty-target batch at step {step}, micro_step {micro_step}")
+            x, y = next(train_loader)
+            continue
+
         with sync_ctx:
             with autocast_ctx:
                 loss = model(x, y)
             train_loss = loss.detach()
 
-            # NaN detection: find exact micro-step where NaN appears
+            # NaN detection
             if not torch.isfinite(train_loss):
                 print0(f"NaN/Inf loss at step {step}, micro_step {micro_step}")
-                # Check targets
                 valid_targets = (y != -1).sum().item()
-                print0(f"  Valid targets in batch: {valid_targets} / {y.numel()}")
+                print0(f"  Valid targets: {valid_targets} / {y.numel()}")
                 print0(f"  Input range: [{x.min().item()}, {x.max().item()}]")
-                # Check model params
-                raw = orig_model
-                for name, p in raw.named_parameters():
-                    if not torch.isfinite(p).all():
-                        print0(f"  Non-finite param BEFORE backward: {name}")
                 break
 
             loss = loss / grad_accum_steps
@@ -558,22 +594,12 @@ while True:
         # Check for NaN gradients
         if not torch.isfinite(grad_norm):
             print0(f"NaN/Inf gradient norm at step {step}")
-            for name, p in orig_model.named_parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    print0(f"  Non-finite grad: {name}, max={p.grad.abs().max().item()}")
 
         # Optimizer step
         adamw_opt.step()
         muon_opt.step()
         adamw_opt.zero_grad(set_to_none=True)
         muon_opt.zero_grad(set_to_none=True)
-
-        # Check params after optimizer step
-        if step < 5:
-            for name, p in orig_model.named_parameters():
-                if not torch.isfinite(p).all():
-                    print0(f"  Non-finite param AFTER optimizer step {step}: {name}")
-                    break
 
     synchronize()
     t1 = time.time()
