@@ -42,7 +42,7 @@ from tasks.customjson import CustomJSON
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) for nano_hindi")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb)")
+parser.add_argument("--wandb-run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb)")
 # Runtime
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
 # Model loading
@@ -88,7 +88,7 @@ synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: N
 get_max_memory = torch.cuda.max_memory_allocated if torch.cuda.is_available() else lambda: 0
 
 # Wandb
-use_dummy_wandb = args.run == "dummy" or not master_process
+use_dummy_wandb = args.wandb_run == "dummy" or not master_process
 if use_dummy_wandb:
     class DummyWandb:
         def log(self, *a, **kw): pass
@@ -96,7 +96,7 @@ if use_dummy_wandb:
     wandb_run = DummyWandb()
 else:
     import wandb
-    wandb_run = wandb.init(project="nano-hindi-sft", name=args.run, config=vars(args))
+    wandb_run = wandb.init(project="nano-hindi-sft", name=args.wandb_run, config=vars(args))
 
 # -----------------------------------------------------------------------------
 # Load model from pretrained checkpoint
