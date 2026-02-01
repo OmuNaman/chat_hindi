@@ -2,8 +2,13 @@
 Inference script for nano_hindi.
 
 Usage:
+    # Base model (completion mode)
     python generate.py --checkpoint checkpoints/checkpoint_step5000.pt --prompt "भारत एक"
     python generate.py --checkpoint checkpoints/checkpoint_step5000.pt --interactive
+
+    # SFT model (chat mode)
+    python generate.py --checkpoint sft_checkpoints/sft_step242.pt --chat
+    python generate.py --checkpoint sft_checkpoints/sft_step242.pt --chat --prompt "तुम कौन हो?"
 """
 
 import argparse
@@ -41,7 +46,12 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     model.load_state_dict(new_state_dict)
     model.eval()
 
-    print(f"Loaded from step {checkpoint['step']}, tokens seen: {checkpoint['tokens_seen']:,}")
+    # Handle both pretrain checkpoints (have tokens_seen) and SFT checkpoints
+    tokens_seen = checkpoint.get('tokens_seen', None)
+    if tokens_seen is not None:
+        print(f"Loaded from step {checkpoint['step']}, tokens seen: {tokens_seen:,}")
+    else:
+        print(f"Loaded SFT checkpoint from step {checkpoint['step']}")
 
     return model, config
 
@@ -81,7 +91,7 @@ def generate_text(
 
 
 def interactive_mode(model: GPT, tokenizer, args):
-    """Interactive chat mode."""
+    """Interactive completion mode (base model)."""
     print("\n" + "=" * 60)
     print("nano_hindi Interactive Mode")
     print("Type your Hindi prompt and press Enter to generate.")
@@ -114,6 +124,84 @@ def interactive_mode(model: GPT, tokenizer, args):
             break
 
 
+def chat_mode(model: GPT, tokenizer, args):
+    """
+    Interactive chat mode for SFT models.
+    Uses the conversation template from nano_hindi/tokenizer.py.
+    """
+    from nano_hindi.tokenizer import USER_MARKER, ASSISTANT_MARKER
+
+    print("\n" + "=" * 60)
+    print("नैनो हिंदी Chat Mode (by Vizuara)")
+    print("Type your message and press Enter.")
+    print("Type 'quit' or 'exit' to stop.")
+    print("Type 'clear' to start a new conversation.")
+    print("=" * 60 + "\n")
+
+    device = model.get_device()
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
+
+    # Build conversation context as token IDs
+    context_ids = [bos_id]
+
+    while True:
+        try:
+            user_input = input("आप: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ["quit", "exit", "q"]:
+                print("धन्यवाद! Goodbye!")
+                break
+            if user_input.lower() == "clear":
+                context_ids = [bos_id]
+                print("[Conversation cleared]\n")
+                continue
+
+            # Encode user turn
+            user_text = USER_MARKER + user_input + "\n\n"
+            user_ids = tokenizer.encode(user_text, add_special_tokens=False)
+            context_ids.extend(user_ids)
+
+            # Encode assistant marker (model generates the rest)
+            marker_ids = tokenizer.encode(ASSISTANT_MARKER, add_special_tokens=False)
+            context_ids.extend(marker_ids)
+
+            # Truncate context if too long (keep last max_seq_len tokens)
+            max_ctx = 900  # Leave room for generation
+            if len(context_ids) > max_ctx:
+                context_ids = [bos_id] + context_ids[-(max_ctx - 1):]
+
+            # Generate
+            generated = []
+            with torch.autocast(device_type=device.type if hasattr(device, 'type') else 'cuda', dtype=torch.bfloat16):
+                for token in model.generate(
+                    context_ids,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    seed=args.seed + len(context_ids),  # Vary seed per turn
+                ):
+                    generated.append(token)
+                    if token == eos_id:
+                        break
+
+            # Decode only the generated part
+            response = tokenizer.decode(generated)
+            # Clean up: remove EOS token text and trailing whitespace
+            response = response.replace("</s>", "").strip()
+
+            print(f"\nनैनो हिंदी: {response}\n")
+
+            # Add generated tokens to context for multi-turn
+            response_ids = tokenizer.encode(response + "\n\n", add_special_tokens=False)
+            context_ids.extend(response_ids)
+
+        except KeyboardInterrupt:
+            print("\nधन्यवाद! Goodbye!")
+            break
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate text with nano_hindi")
     parser.add_argument(
@@ -131,7 +219,12 @@ def main():
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Run in interactive mode",
+        help="Run in interactive completion mode (base model)",
+    )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Run in chat mode (SFT model) with conversation template",
     )
     parser.add_argument(
         "--max_tokens",
@@ -170,7 +263,9 @@ def main():
     model, config = load_model(args.checkpoint, args.device)
     tokenizer = AutoTokenizer.from_pretrained("sarvamai/sarvam-1")
 
-    if args.interactive:
+    if args.chat:
+        chat_mode(model, tokenizer, args)
+    elif args.interactive:
         interactive_mode(model, tokenizer, args)
     elif args.prompt:
         output = generate_text(
