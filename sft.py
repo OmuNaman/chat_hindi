@@ -521,29 +521,59 @@ while True:
             with autocast_ctx:
                 loss = model(x, y)
             train_loss = loss.detach()
+
+            # NaN detection: find exact micro-step where NaN appears
+            if not torch.isfinite(train_loss):
+                print0(f"NaN/Inf loss at step {step}, micro_step {micro_step}")
+                # Check targets
+                valid_targets = (y != -1).sum().item()
+                print0(f"  Valid targets in batch: {valid_targets} / {y.numel()}")
+                print0(f"  Input range: [{x.min().item()}, {x.max().item()}]")
+                # Check model params
+                raw = orig_model
+                for name, p in raw.named_parameters():
+                    if not torch.isfinite(p).all():
+                        print0(f"  Non-finite param BEFORE backward: {name}")
+                break
+
             loss = loss / grad_accum_steps
             loss.backward()
 
         x, y = next(train_loader)
         progress = max(progress, approx_progress)
+    else:
+        # Only run optimizer if we didn't break out of the loop
+        # LR schedule
+        lrm = get_lr_multiplier(step, progress)
+        muon_momentum = get_muon_momentum(step)
+        for group in adamw_opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+        for group in muon_opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            group["momentum"] = muon_momentum
 
-    # LR schedule
-    lrm = get_lr_multiplier(step, progress)
-    muon_momentum = get_muon_momentum(step)
-    for group in adamw_opt.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-    for group in muon_opt.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        group["momentum"] = muon_momentum
+        # Gradient clipping
+        grad_norm = nn.utils.clip_grad_norm_(all_params, 1.0)
 
-    # Gradient clipping
-    nn.utils.clip_grad_norm_(all_params, 1.0)
+        # Check for NaN gradients
+        if not torch.isfinite(grad_norm):
+            print0(f"NaN/Inf gradient norm at step {step}")
+            for name, p in orig_model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    print0(f"  Non-finite grad: {name}, max={p.grad.abs().max().item()}")
 
-    # Optimizer step
-    adamw_opt.step()
-    muon_opt.step()
-    adamw_opt.zero_grad(set_to_none=True)
-    muon_opt.zero_grad(set_to_none=True)
+        # Optimizer step
+        adamw_opt.step()
+        muon_opt.step()
+        adamw_opt.zero_grad(set_to_none=True)
+        muon_opt.zero_grad(set_to_none=True)
+
+        # Check params after optimizer step
+        if step < 5:
+            for name, p in orig_model.named_parameters():
+                if not torch.isfinite(p).all():
+                    print0(f"  Non-finite param AFTER optimizer step {step}: {name}")
+                    break
 
     synchronize()
     t1 = time.time()
