@@ -122,7 +122,8 @@ model.load_state_dict(new_state_dict)
 print0(f"Model loaded: {model.num_params():,} parameters")
 
 del checkpoint
-torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 orig_model = model
 
@@ -148,31 +149,41 @@ train_dataset = HindiGSM8K(split="train")   # ~1055 questions
 val_dataset = HindiGSM8K(split="test")       # ~264 questions
 print0(f"Train: {len(train_dataset)} questions, Val: {len(val_dataset)} questions")
 
-# Epoch cycling cursor
+# Epoch cycling cursor — all ranks advance together but each picks different indices
 train_indices = list(range(len(train_dataset)))
 random.seed(42)
 random.shuffle(train_indices)
 cursor = 0
 current_epoch = 1
 
-def sample_questions(n):
-    """Sample n questions from training set, cycling through epochs."""
+# DDP: split questions across ranks
+assert args.questions_per_step % world_size == 0, \
+    f"questions_per_step ({args.questions_per_step}) must be divisible by world_size ({world_size})"
+questions_per_rank = args.questions_per_step // world_size
+
+def sample_questions(n_per_rank):
+    """Sample questions for this rank. All ranks advance cursor by questions_per_step."""
     global cursor, current_epoch
+    # Total questions consumed this step (across all ranks)
+    total_needed = n_per_rank * world_size
     questions = []
-    for _ in range(n):
+    indices_this_step = []
+
+    for _ in range(total_needed):
         if cursor >= len(train_indices):
             cursor = 0
             current_epoch += 1
             random.shuffle(train_indices)
             print0(f"Starting epoch {current_epoch}")
-        questions.append(train_dataset[train_indices[cursor]])
+        indices_this_step.append(train_indices[cursor])
         cursor += 1
-    return questions
 
-# DDP: split questions across ranks
-assert args.questions_per_step % world_size == 0, \
-    f"questions_per_step ({args.questions_per_step}) must be divisible by world_size ({world_size})"
-questions_per_rank = args.questions_per_step // world_size
+    # Each rank picks its slice: rank 0 gets [0, world_size, 2*world_size, ...],
+    # rank 1 gets [1, 1+world_size, ...] etc. — interleaved for diversity
+    for i in range(rank, total_needed, world_size):
+        questions.append(train_dataset[indices_this_step[i]])
+
+    return questions
 
 # -----------------------------------------------------------------------------
 # Optimizer setup (same dual Muon+AdamW pattern as sft.py)
@@ -230,6 +241,9 @@ def setup_rl_optimizers(model, ddp_mode):
 
 adamw_opt, muon_opt = setup_rl_optimizers(orig_model, ddp)
 all_params = [p for p in model.parameters() if p.requires_grad]
+
+# DDP no_sync context for gradient accumulation
+no_sync_ctx = model.no_sync if ddp else nullcontext
 
 # LR schedule: linear warmup then linear decay to zero
 def get_lr_multiplier(step):
@@ -468,7 +482,7 @@ def evaluate_pass_at_k(max_questions=None, num_samples=None, temperature=1.0):
             max_tokens=args.max_gen_tokens,
             temperature=temperature,
             top_k=args.top_k,
-            use_calc=args.use_calculator,
+            use_calc=False,  # Don't modify tokens
             seed=hash(("eval", idx)) & 0x7FFFFFFF,
         )
 
@@ -476,7 +490,9 @@ def evaluate_pass_at_k(max_questions=None, num_samples=None, temperature=1.0):
         for seq in seqs:
             gen_tokens = seq[len(prompt_ids):]
             gen_text = tokenizer.decode(gen_tokens)
-            r = val_dataset.reward(conv, gen_text)
+            # Use calculator for reward evaluation if enabled
+            reward_text = _process_calculator(gen_text) if args.use_calculator else gen_text
+            r = val_dataset.reward(conv, reward_text)
             rewards.append(r)
 
         if rewards[0] > 0:
@@ -579,22 +595,29 @@ for step in range(args.num_iterations):
         prompt_ids = tokenizer.render_for_completion(conv)
 
         with autocast_ctx:
+            # Generate WITHOUT calculator (get original model tokens for PG training)
             seqs, masks = generate_batch(
                 model, prompt_ids, args.num_samples,
                 max_tokens=args.max_gen_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
-                use_calc=args.use_calculator,
+                use_calc=False,  # Never modify tokens for PG — keep on-policy
                 seed=hash((step, rank, q_idx)) & 0x7FFFFFFF,
             )
 
         for seq, mask in zip(seqs, masks):
             gen_tokens = seq[len(prompt_ids):]
             gen_text = tokenizer.decode(gen_tokens)
-            reward = train_dataset.reward(conv, gen_text)
+
+            # For reward: optionally use calculator to correct <<expr=result>> answers
+            if args.use_calculator:
+                reward_text = _process_calculator(gen_text)
+            else:
+                reward_text = gen_text
+            reward = train_dataset.reward(conv, reward_text)
 
             all_prompts.append(prompt_ids)
-            all_completions.append(gen_tokens)
+            all_completions.append(gen_tokens)  # Original tokens for PG (on-policy)
             all_rewards.append(reward)
 
     # -------------------------------------------------------------------------
@@ -631,10 +654,11 @@ for step in range(args.num_iterations):
     total_valid_tokens = 0
     num_sequences = len(all_prompts)
 
-    # Process in mini-batches
-    for mb_start in range(0, num_sequences, args.device_batch_size):
+    # Process in mini-batches (use no_sync for all but last to avoid premature DDP all-reduce)
+    num_mini_batches = (num_sequences + args.device_batch_size - 1) // args.device_batch_size
+    for mb_idx, mb_start in enumerate(range(0, num_sequences, args.device_batch_size)):
         mb_end = min(mb_start + args.device_batch_size, num_sequences)
-        mb_size = mb_end - mb_start
+        is_last_mb = (mb_idx == num_mini_batches - 1)
 
         mb_input_ids, mb_target_ids, mb_adv = prepare_pg_batch(
             all_prompts[mb_start:mb_end],
@@ -643,28 +667,31 @@ for step in range(args.num_iterations):
             args.max_seq_len,
         )
 
-        with autocast_ctx:
-            # Per-token loss: cross_entropy with reduction='none'
-            # Returns (B*T,) flattened, with ignore_index=-1 positions set to 0
-            per_token_loss = model(mb_input_ids, mb_target_ids, loss_reduction='none')
-            per_token_loss = per_token_loss.view(mb_input_ids.size(0), -1)  # (B, T)
+        sync_ctx = nullcontext() if is_last_mb else no_sync_ctx()
 
-            # Mask: only completion tokens contribute
-            valid_mask = (mb_target_ids != -1).float()  # (B, T)
+        with sync_ctx:
+            with autocast_ctx:
+                # Per-token loss: cross_entropy with reduction='none'
+                # Returns (B*T,) flattened, with ignore_index=-1 positions set to 0
+                per_token_loss = model(mb_input_ids, mb_target_ids, loss_reduction='none')
+                per_token_loss = per_token_loss.view(mb_input_ids.size(0), -1)  # (B, T)
 
-            # PG objective: advantage * log_prob = -advantage * ce_loss
-            # We want to MINIMIZE the loss, so: loss = sum(ce_loss * advantage) / total_tokens
-            # (positive advantage + minimize ce_loss = maximize log_prob for good completions)
-            adv_expanded = mb_adv.unsqueeze(1)  # (B, 1)
-            pg_loss = (per_token_loss * valid_mask * adv_expanded).sum()
-            num_valid = valid_mask.sum()
+                # Mask: only completion tokens contribute
+                valid_mask = (mb_target_ids != -1).float()  # (B, T)
 
-            total_pg_loss += pg_loss.detach().item()
-            total_valid_tokens += num_valid.item()
+                # PG objective: advantage * log_prob = -advantage * ce_loss
+                # We want to MINIMIZE the loss, so: loss = sum(ce_loss * advantage) / total_tokens
+                # (positive advantage + minimize ce_loss = maximize log_prob for good completions)
+                adv_expanded = mb_adv.unsqueeze(1)  # (B, 1)
+                pg_loss = (per_token_loss * valid_mask * adv_expanded).sum()
+                num_valid = valid_mask.sum()
 
-            # Normalize by total tokens across all mini-batches and sequences
-            normalized_loss = pg_loss / max(num_valid, 1)
-            normalized_loss.backward()
+                total_pg_loss += pg_loss.detach().item()
+                total_valid_tokens += num_valid.item()
+
+                # Normalize by total tokens across all mini-batches and sequences
+                normalized_loss = pg_loss / num_valid.clamp(min=1)
+                normalized_loss.backward()
 
     # -------------------------------------------------------------------------
     # Optimizer step
