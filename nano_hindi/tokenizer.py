@@ -118,6 +118,56 @@ class SarvamTokenizer:
 
         return token_ids, mask
 
+    def render_for_completion(self, conversation):
+        """
+        Render a conversation for RL completion generation.
+
+        Strips the last assistant message (the reference answer) and returns
+        token IDs up to and including the assistant marker, so the model can
+        generate the completion.
+
+        Args:
+            conversation: dict with "messages" key. The last message must be
+                         role="assistant" (its content is not included).
+
+        Returns:
+            prompt_ids: list of token IDs (BOS + messages + final assistant marker)
+        """
+        import copy
+        conv = copy.deepcopy(conversation)
+        messages = conv["messages"]
+        assert messages[-1]["role"] == "assistant", "Last message must be assistant"
+        messages.pop()  # Remove last assistant message (reference answer)
+
+        # Render remaining messages
+        token_ids = [self._bos_id]
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            if role == "system":
+                ids = self.tokenizer.encode(content + "\n\n", add_special_tokens=False)
+                token_ids.extend(ids)
+            elif role == "user":
+                ids = self.tokenizer.encode(USER_MARKER + content + "\n\n", add_special_tokens=False)
+                token_ids.extend(ids)
+            elif role == "assistant":
+                # Non-final assistant messages: include marker + content
+                marker_ids = self.tokenizer.encode(ASSISTANT_MARKER, add_special_tokens=False)
+                token_ids.extend(marker_ids)
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = self._render_parts(content)
+                else:
+                    text = str(content)
+                token_ids.extend(self.tokenizer.encode(text + "\n\n", add_special_tokens=False))
+
+        # Prime the assistant for completion
+        marker_ids = self.tokenizer.encode(ASSISTANT_MARKER, add_special_tokens=False)
+        token_ids.extend(marker_ids)
+        return token_ids
+
     def _render_parts(self, parts):
         """Render a list of content parts (text, python tool calls) into a string."""
         rendered = []
