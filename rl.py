@@ -274,7 +274,28 @@ def simple_calculator(expr):
 
 
 # -----------------------------------------------------------------------------
-# Batch generation function (no KV cache, simple autoregressive loop)
+# KV cache for fast autoregressive generation
+class KVCache:
+    """Simple KV cache for autoregressive generation."""
+
+    def __init__(self, batch_size, max_seq_len, n_layers, n_kv_head, head_dim, device, dtype=torch.bfloat16):
+        self.n_layers = n_layers
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.k_cache = torch.zeros(n_layers, batch_size, max_seq_len, n_kv_head, head_dim, device=device, dtype=dtype)
+        self.v_cache = torch.zeros(n_layers, batch_size, max_seq_len, n_kv_head, head_dim, device=device, dtype=dtype)
+
+    def get_layer_cache(self, layer_idx):
+        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+
+    def get_pos(self):
+        return self.cache_seqlens[0].item()
+
+    def advance(self, n):
+        self.cache_seqlens += n
+
+
+# -----------------------------------------------------------------------------
+# Batch generation function (with KV cache)
 @torch.no_grad()
 def generate_batch(
     model_to_use,
@@ -287,7 +308,7 @@ def generate_batch(
     seed=42,
 ):
     """
-    Generate num_samples completions from a single prompt.
+    Generate num_samples completions from a single prompt using KV cache.
 
     Returns:
         sequences: list of full token sequences (prompt + generated)
@@ -300,45 +321,76 @@ def generate_batch(
 
     prompt_len = len(prompt_ids)
     dev = raw.get_device()
+    dev_type = dev.type if hasattr(dev, 'type') else 'cuda'
     rng = torch.Generator(device=dev)
     rng.manual_seed(seed)
 
-    # Initialize: replicate prompt for all samples
-    # Shape: (num_samples, prompt_len)
-    ids = torch.tensor([prompt_ids] * num_samples, dtype=torch.long, device=dev)
-    finished = torch.zeros(num_samples, dtype=torch.bool, device=dev)
+    max_total_len = min(prompt_len + max_tokens, args.max_seq_len)
 
-    for gen_step in range(max_tokens):
-        if finished.all():
+    # Create KV cache
+    cache = KVCache(
+        batch_size=num_samples,
+        max_seq_len=max_total_len,
+        n_layers=raw.config.n_layer,
+        n_kv_head=raw.config.n_kv_head,
+        head_dim=raw.config.head_dim,
+        device=dev,
+        dtype=ptdtype,
+    )
+
+    # Prefill: process entire prompt at once
+    prompt_tensor = torch.tensor([prompt_ids] * num_samples, dtype=torch.long, device=dev)
+    with torch.autocast(device_type=dev_type, dtype=ptdtype):
+        logits = raw(prompt_tensor, kv_cache=cache)  # (B, T, V)
+    logits = logits[:, -1, :]  # (B, V) last position
+
+    # Sample first token
+    if top_k > 0:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float("Inf")
+    if temperature > 0:
+        logits = logits / temperature
+        probs = F.softmax(logits, dim=-1)
+        next_tokens = torch.multinomial(probs, num_samples=1, generator=rng)
+    else:
+        next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+
+    # Track all generated token IDs
+    all_ids = [prompt_tensor]  # list of tensors to cat later
+    all_ids.append(next_tokens)
+    finished = (next_tokens.squeeze(-1) == eos_id)
+
+    # Decode: one token at a time with KV cache
+    for gen_step in range(1, max_tokens):
+        if finished.all() or cache.get_pos() >= max_total_len:
             break
 
-        # Truncate input if exceeds max_seq_len (keep last max_seq_len tokens)
-        input_ids = ids if ids.size(1) <= args.max_seq_len else ids[:, -args.max_seq_len:]
+        # For finished sequences, force BOS (padding token)
+        input_token = next_tokens.clone()
+        input_token[finished] = bos_id
 
-        with torch.autocast(device_type=dev.type if hasattr(dev, 'type') else 'cuda', dtype=ptdtype):
-            logits = raw(input_ids)  # (B, T, V)
-        logits = logits[:, -1, :]  # (B, V) last position
+        with torch.autocast(device_type=dev_type, dtype=ptdtype):
+            logits = raw(input_token, kv_cache=cache)  # (B, 1, V)
+        logits = logits[:, -1, :]
 
         if top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = -float("Inf")
-
         if temperature > 0:
             logits = logits / temperature
             probs = F.softmax(logits, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1, generator=rng)  # (B, 1)
+            next_tokens = torch.multinomial(probs, num_samples=1, generator=rng)
         else:
-            next_tokens = torch.argmax(logits, dim=-1, keepdim=True)  # (B, 1)
+            next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
 
-        # For finished sequences, force BOS (padding token)
         next_tokens[finished] = bos_id
+        all_ids.append(next_tokens)
 
-        ids = torch.cat([ids, next_tokens], dim=1)
-
-        # Check for EOS
-        just_generated = next_tokens.squeeze(-1)
-        newly_finished = (just_generated == eos_id) & ~finished
+        newly_finished = (next_tokens.squeeze(-1) == eos_id) & ~finished
         finished = finished | newly_finished
+
+    # Concatenate all token IDs
+    ids = torch.cat(all_ids, dim=1)
 
     # Convert to lists and build masks
     sequences = []
