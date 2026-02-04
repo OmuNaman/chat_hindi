@@ -306,9 +306,11 @@ def generate_batch(
     top_k,
     use_calc=False,
     seed=42,
+    kv_cache_buffer=None,
 ):
     """
     Generate num_samples completions from a single prompt using KV cache.
+    Accepts an optional pre-allocated kv_cache_buffer to avoid repeated GPU malloc.
 
     Returns:
         sequences: list of full token sequences (prompt + generated)
@@ -327,16 +329,20 @@ def generate_batch(
 
     max_total_len = min(prompt_len + max_tokens, args.max_seq_len)
 
-    # Create KV cache
-    cache = KVCache(
-        batch_size=num_samples,
-        max_seq_len=max_total_len,
-        n_layers=raw.config.n_layer,
-        n_kv_head=raw.config.n_kv_head,
-        head_dim=raw.config.head_dim,
-        device=dev,
-        dtype=ptdtype,
-    )
+    # Reuse pre-allocated cache or create a new one
+    if kv_cache_buffer is not None:
+        cache = kv_cache_buffer
+        cache.cache_seqlens.fill_(0)  # Reset position, no need to zero k/v tensors
+    else:
+        cache = KVCache(
+            batch_size=num_samples,
+            max_seq_len=max_total_len,
+            n_layers=raw.config.n_layer,
+            n_kv_head=raw.config.n_kv_head,
+            head_dim=raw.config.head_dim,
+            device=dev,
+            dtype=ptdtype,
+        )
 
     # Prefill: process entire prompt at once
     prompt_tensor = torch.tensor([prompt_ids] * num_samples, dtype=torch.long, device=dev)
@@ -536,6 +542,7 @@ def evaluate_pass_at_k(max_questions=None, num_samples=None, temperature=1.0):
             top_k=args.top_k,
             use_calc=False,  # Don't modify tokens
             seed=hash(("eval", idx)) & 0x7FFFFFFF,
+            kv_cache_buffer=eval_cache if num_samples == args.eval_samples else None,
         )
 
         rewards = []
@@ -605,6 +612,28 @@ print0(f"Per-rank: {questions_per_rank} questions/step")
 print0(f"LR: matrix={args.matrix_lr}, embedding={args.embedding_lr}")
 print0(f"Calculator: {'enabled' if args.use_calculator else 'disabled'}")
 
+# Pre-allocate a reusable KV cache for rollout generation (avoids repeated GPU malloc)
+print0("Allocating rollout KV cache...")
+rollout_cache = KVCache(
+    batch_size=args.num_samples,
+    max_seq_len=args.max_seq_len,
+    n_layers=model_config.n_layer,
+    n_kv_head=model_config.n_kv_head,
+    head_dim=model_config.head_dim,
+    device=device,
+    dtype=ptdtype,
+)
+# Separate cache for eval (may use different num_samples)
+eval_cache = KVCache(
+    batch_size=args.eval_samples,
+    max_seq_len=args.max_seq_len,
+    n_layers=model_config.n_layer,
+    n_kv_head=model_config.n_kv_head,
+    head_dim=model_config.head_dim,
+    device=device,
+    dtype=ptdtype,
+)
+
 total_training_time = 0.0
 last_pass_at_1 = None
 last_mean_reward = None
@@ -655,6 +684,7 @@ for step in range(args.num_iterations):
                 top_k=args.top_k,
                 use_calc=False,  # Never modify tokens for PG — keep on-policy
                 seed=hash((step, rank, q_idx)) & 0x7FFFFFFF,
+                kv_cache_buffer=rollout_cache,
             )
 
         for seq, mask in zip(seqs, masks):
