@@ -6,3 +6,7 @@ calc_params_250m.py
 MODEL_ARCHITECTURE.md
 __pycache__/
 REPORT.md
+checkpoints/
+sft_checkpoints/
+rl_checkpoints/
+chat_history/
