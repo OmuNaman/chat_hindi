@@ -20,3 +20,6 @@ local.properties
 
 # Gradle
 .gradle/
+
+# Documentation (kept locally, not in repo)
+ANDROID_DOCUMENTATION.md

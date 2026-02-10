@@ -10,3 +10,4 @@ checkpoints/
 sft_checkpoints/
 rl_checkpoints/
 chat_history/
+MOBILE_DEPLOYMENT.md
