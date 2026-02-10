@@ -1,0 +1,22 @@
+# Build outputs
+build/
+app/build/
+app/.cxx/
+
+# Binaries (hosted on HuggingFace)
+*.bin
+*.exe
+
+# Local config
+local.properties
+
+# Test outputs
+*.txt
+!CMakeLists.txt
+
+# IDE
+.idea/
+*.iml
+
+# Gradle
+.gradle/

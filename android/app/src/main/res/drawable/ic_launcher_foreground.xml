@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Orange circle -->
+    <path
+        android:fillColor="#FF6B35"
+        android:pathData="M54,54m-30,0a30,30 0,1 1,60 0a30,30 0,1 1,-60 0"/>
+    <!-- "N" letter for Nano Hindi -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,40 L40,68 L45,68 L45,50 L58,68 L63,68 L63,40 L58,40 L58,58 L45,40 Z"/>
+</vector>
