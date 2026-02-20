@@ -11,3 +11,7 @@ sft_checkpoints/
 rl_checkpoints/
 chat_history/
 MOBILE_DEPLOYMENT.md
+*.bin
+*.exe
+gpt_oss/raw_bin/
+nul
