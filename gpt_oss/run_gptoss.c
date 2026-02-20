@@ -1012,7 +1012,302 @@ void print_metrics(Metrics* m, long gen_end_ms) {
 }
 
 // ============================================================================
-// Section 13: Main entry point
+// Section 13: Harmony chat template
+// ============================================================================
+
+void chat_state_init(ChatState* cs, int show_thinking, ReasoningLevel level) {
+    memset(cs, 0, sizeof(ChatState));
+    cs->show_thinking = show_thinking;
+    cs->reasoning_level = level;
+}
+
+// Append n tokens from src to cs->history, guarding overflow
+static void history_append(ChatState* cs, const int* src, int n) {
+    for (int i = 0; i < n && cs->history_len < 4096; i++) {
+        cs->history[cs->history_len++] = src[i];
+    }
+}
+
+// Append a single token to cs->history
+static void history_push(ChatState* cs, int token) {
+    if (cs->history_len < 4096) {
+        cs->history[cs->history_len++] = token;
+    }
+}
+
+// Build system message tokens into history (called once on first turn)
+static void chat_build_system_message(ChatState* cs, Tokenizer* t) {
+    int tmp[64], n_tmp;
+
+    history_push(cs, HARM_START);
+
+    encode(t, "system", 0, 0, tmp, &n_tmp);
+    history_append(cs, tmp, n_tmp);
+
+    history_push(cs, HARM_MESSAGE);
+
+    const char* body;
+    switch (cs->reasoning_level) {
+        case REASONING_HIGH:   body = "Reasoning: high\n"; break;
+        case REASONING_LOW:    body = "Reasoning: low\n"; break;
+        default:               body = "Reasoning: medium\n"; break;
+    }
+    encode(t, body, 0, 0, tmp, &n_tmp);
+    history_append(cs, tmp, n_tmp);
+
+    history_push(cs, HARM_END);
+}
+
+int chat_build_prompt(ChatState* cs, Tokenizer* t, const char* user_message,
+                      int* out_tokens, int* n_tokens) {
+    int tmp[2048], n_tmp;
+
+    // First turn: prepend system message
+    if (cs->history_len == 0) {
+        chat_build_system_message(cs, t);
+    }
+
+    // User message: <|start|>user<|message|>{text}<|end|>
+    history_push(cs, HARM_START);
+    encode(t, "user", 0, 0, tmp, &n_tmp);
+    history_append(cs, tmp, n_tmp);
+    history_push(cs, HARM_MESSAGE);
+    encode(t, user_message, 0, 0, tmp, &n_tmp);
+    history_append(cs, tmp, n_tmp);
+    history_push(cs, HARM_END);
+
+    // Generation prefix: <|start|>assistant
+    history_push(cs, HARM_START);
+    encode(t, "assistant", 0, 0, tmp, &n_tmp);
+    history_append(cs, tmp, n_tmp);
+
+    // Context window management: if history too long, drop oldest turns
+    if (cs->history_len > MAX_HISTORY_TOKENS) {
+        // Find end of system message (first HARM_END)
+        int sys_end = 0;
+        for (int i = 0; i < cs->history_len; i++) {
+            if (cs->history[i] == HARM_END) { sys_end = i + 1; break; }
+        }
+        // Drop enough old turns to fit
+        int excess = cs->history_len - MAX_HISTORY_TOKENS;
+        int cut = sys_end + excess;
+        // Advance cut to next message boundary (HARM_START)
+        while (cut < cs->history_len && cs->history[cut] != HARM_START) cut++;
+        if (cut > sys_end && cut < cs->history_len) {
+            int remaining = cs->history_len - cut;
+            memmove(cs->history + sys_end, cs->history + cut, remaining * sizeof(int));
+            cs->history_len = sys_end + remaining;
+        }
+    }
+
+    memcpy(out_tokens, cs->history, cs->history_len * sizeof(int));
+    *n_tokens = cs->history_len;
+    return 0;
+}
+
+int chat_process_token(ChatState* cs, Tokenizer* t, int token, int* should_stop) {
+    *should_stop = 0;
+
+    // Stop on <|return|> (200002 = EOS)
+    if (token == 200002) {
+        *should_stop = 1;
+        return 0;
+    }
+
+    switch (cs->parse_state) {
+    case PARSE_CONTENT:
+        if (token == HARM_START) {
+            cs->parse_state = PARSE_SAW_START;
+            cs->role_buf_len = 0;
+            cs->channel_buf_len = 0;
+            return 0;
+        }
+        if (token == HARM_END) {
+            // End of a message segment (e.g. analysis → final transition)
+            return 0;
+        }
+        // Regular content token — print based on channel
+        if (cs->current_channel == CHANNEL_ANALYSIS) {
+            cs->thinking_tokens++;
+            if (cs->show_thinking) {
+                if (!cs->analysis_printed_header) {
+                    fprintf(stderr, "\n[Thinking...]\n");
+                    cs->analysis_printed_header = 1;
+                    cs->thinking_start_ms = time_in_ms();
+                }
+                return 1;  // Print thinking content
+            }
+            return 0;  // Suppress analysis
+        }
+        // FINAL or NONE — always print
+        cs->response_tokens++;
+        return 1;
+
+    case PARSE_SAW_START:
+        if (token == HARM_CHANNEL) {
+            cs->parse_state = PARSE_SAW_CHANNEL;
+            return 0;
+        }
+        if (token == HARM_MESSAGE) {
+            // No channel → CHANNEL_NONE (fallback)
+            cs->current_channel = CHANNEL_NONE;
+            cs->parse_state = PARSE_CONTENT;
+            return 0;
+        }
+        // Role text token (e.g. "assistant")
+        {
+            char* piece = decode(t, 0, token);
+            int plen = (int)strlen(piece);
+            if (cs->role_buf_len + plen < MAX_CHAT_BUF - 1) {
+                memcpy(cs->role_buf + cs->role_buf_len, piece, plen);
+                cs->role_buf_len += plen;
+                cs->role_buf[cs->role_buf_len] = '\0';
+            }
+        }
+        cs->parse_state = PARSE_IN_ROLE;
+        return 0;
+
+    case PARSE_IN_ROLE:
+        if (token == HARM_CHANNEL) {
+            cs->parse_state = PARSE_SAW_CHANNEL;
+            return 0;
+        }
+        if (token == HARM_MESSAGE) {
+            cs->current_channel = CHANNEL_NONE;
+            cs->parse_state = PARSE_CONTENT;
+            return 0;
+        }
+        // More role text
+        {
+            char* piece = decode(t, 0, token);
+            int plen = (int)strlen(piece);
+            if (cs->role_buf_len + plen < MAX_CHAT_BUF - 1) {
+                memcpy(cs->role_buf + cs->role_buf_len, piece, plen);
+                cs->role_buf_len += plen;
+                cs->role_buf[cs->role_buf_len] = '\0';
+            }
+        }
+        return 0;
+
+    case PARSE_SAW_CHANNEL:
+        // First token of channel name
+        {
+            char* piece = decode(t, 0, token);
+            int plen = (int)strlen(piece);
+            if (plen < MAX_CHAT_BUF - 1) {
+                memcpy(cs->channel_buf, piece, plen);
+                cs->channel_buf_len = plen;
+                cs->channel_buf[plen] = '\0';
+            }
+        }
+        cs->parse_state = PARSE_IN_CHANNEL_NAME;
+        return 0;
+
+    case PARSE_IN_CHANNEL_NAME:
+        if (token == HARM_MESSAGE) {
+            // Channel name complete — identify it
+            if (strncmp(cs->channel_buf, "analysis", 8) == 0) {
+                cs->current_channel = CHANNEL_ANALYSIS;
+            } else if (strncmp(cs->channel_buf, "final", 5) == 0) {
+                cs->current_channel = CHANNEL_FINAL;
+                // Transition from thinking to response
+                if (cs->analysis_printed_header && cs->show_thinking) {
+                    long now = time_in_ms();
+                    if (cs->thinking_start_ms > 0) {
+                        double think_sec = (now - cs->thinking_start_ms) / 1000.0;
+                        fprintf(stderr, "[Thought for %.1f seconds, %d tokens]\n\n",
+                                think_sec, cs->thinking_tokens);
+                    }
+                }
+            } else if (strncmp(cs->channel_buf, "commentary", 10) == 0) {
+                cs->current_channel = CHANNEL_COMMENTARY;
+            } else {
+                cs->current_channel = CHANNEL_NONE;
+            }
+            cs->parse_state = PARSE_CONTENT;
+            return 0;
+        }
+        // More channel name text
+        {
+            char* piece = decode(t, 0, token);
+            int plen = (int)strlen(piece);
+            if (cs->channel_buf_len + plen < MAX_CHAT_BUF - 1) {
+                memcpy(cs->channel_buf + cs->channel_buf_len, piece, plen);
+                cs->channel_buf_len += plen;
+                cs->channel_buf[cs->channel_buf_len] = '\0';
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+void chat_store_response(ChatState* cs, Tokenizer* t,
+                         const int* gen_tokens, int n_gen) {
+    // Walk generated tokens with a mini state machine to identify channels,
+    // then store only final-channel (and structural) tokens in history.
+    // Replace <|return|> (200002) with <|end|> (HARM_END).
+
+    HarmonyParseState st = PARSE_CONTENT;
+    int final_start = -1;  // Start of the final-channel segment in gen_tokens
+
+    for (int i = 0; i < n_gen; i++) {
+        int tok = gen_tokens[i];
+
+        switch (st) {
+        case PARSE_CONTENT:
+            if (tok == HARM_START) { st = PARSE_SAW_START; }
+            break;
+        case PARSE_SAW_START:
+            if (tok == HARM_CHANNEL) { st = PARSE_SAW_CHANNEL; }
+            else if (tok == HARM_MESSAGE) { st = PARSE_CONTENT; }
+            else { st = PARSE_IN_ROLE; }
+            break;
+        case PARSE_IN_ROLE:
+            if (tok == HARM_CHANNEL) { st = PARSE_SAW_CHANNEL; }
+            else if (tok == HARM_MESSAGE) { st = PARSE_CONTENT; }
+            break;
+        case PARSE_SAW_CHANNEL: {
+            // Peek at the channel name token
+            char* piece = decode(t, 0, tok);
+            if (strncmp(piece, "final", 5) == 0) {
+                // Walk back to find the <|start|> for this segment
+                for (int j = i - 1; j >= 0; j--) {
+                    if (gen_tokens[j] == HARM_START) { final_start = j; break; }
+                }
+            }
+            st = PARSE_IN_CHANNEL_NAME;
+            break;
+        }
+        case PARSE_IN_CHANNEL_NAME:
+            if (tok == HARM_MESSAGE) { st = PARSE_CONTENT; }
+            break;
+        }
+    }
+
+    // If we found a final channel, store from final_start.
+    // Otherwise, store everything (fallback for models that don't use channels).
+    int copy_from = (final_start >= 0) ? final_start : 0;
+
+    for (int i = copy_from; i < n_gen && cs->history_len < 4096; i++) {
+        int tok = gen_tokens[i];
+        // Skip analysis channel tokens when copying
+        if (tok == 200002) {
+            // Replace <|return|> with <|end|>
+            history_push(cs, HARM_END);
+        } else {
+            history_push(cs, tok);
+        }
+    }
+
+    // If no <|return|> was at the end, ensure we close with <|end|>
+    if (n_gen > 0 && gen_tokens[n_gen - 1] != 200002) {
+        history_push(cs, HARM_END);
+    }
+}
+
+// ============================================================================
+// Section 14: Main entry point
 // ============================================================================
 
 #ifndef __ANDROID__
@@ -1048,6 +1343,8 @@ int main(int argc, char* argv[]) {
     char* prompt = NULL;
     int chat_mode = 0;
     unsigned long long rng_seed = 0;
+    ReasoningLevel reasoning_level = REASONING_MEDIUM;
+    int show_thinking = 0;
 
     // Parse command line
     for (int i = 1; i < argc; i++) {
@@ -1059,6 +1356,13 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) { prompt = argv[++i]; }
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) { rng_seed = atoll(argv[++i]); }
         else if (strcmp(argv[i], "--chat") == 0) { chat_mode = 1; }
+        else if (strcmp(argv[i], "--reasoning") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "high") == 0) reasoning_level = REASONING_HIGH;
+            else if (strcmp(argv[i], "low") == 0) reasoning_level = REASONING_LOW;
+            else reasoning_level = REASONING_MEDIUM;
+        }
+        else if (strcmp(argv[i], "--show-thinking") == 0) { show_thinking = 1; }
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
         }
@@ -1069,7 +1373,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Usage: %s --model <model.bin> --tokenizer <tokenizer.bin> [options]\n\n", argv[0]);
         fprintf(stderr, "Options:\n");
         fprintf(stderr, "  --prompt <text>     Input prompt (completion mode)\n");
-        fprintf(stderr, "  --chat              Interactive chat mode\n");
+        fprintf(stderr, "  --chat              Interactive chat mode (Harmony format)\n");
+        fprintf(stderr, "  --reasoning <level> Reasoning effort: high|medium|low (default: medium)\n");
+        fprintf(stderr, "  --show-thinking     Show chain-of-thought (analysis channel)\n");
         fprintf(stderr, "  --temp <float>      Temperature (default: 0.7)\n");
         fprintf(stderr, "  --top_k <int>       Top-k sampling (default: 40)\n");
         fprintf(stderr, "  --max_tokens <int>  Max tokens to generate (default: 512)\n");
@@ -1111,10 +1417,17 @@ int main(int argc, char* argv[]) {
     int eos_id = transformer.config.eos_token_id;
 
     if (chat_mode) {
-        // Interactive chat loop
+        // Harmony chat mode — multi-channel structured output
+        ChatState chat;
+        chat_state_init(&chat, show_thinking, reasoning_level);
+
         char input_buffer[2048];
-        fprintf(stderr, "\n=== GPT-OSS 20B Chat ===\n");
-        fprintf(stderr, "Type your message. Type 'quit' to exit.\n\n");
+        fprintf(stderr, "\n=== GPT-OSS 20B Chat (Harmony) ===\n");
+        fprintf(stderr, "Reasoning: %s | Thinking: %s\n",
+                reasoning_level == REASONING_HIGH ? "high" :
+                reasoning_level == REASONING_LOW ? "low" : "medium",
+                show_thinking ? "visible" : "hidden");
+        fprintf(stderr, "Commands: 'quit' to exit, 'clear' to reset.\n\n");
 
         while (1) {
             fprintf(stdout, "You: ");
@@ -1126,40 +1439,74 @@ int main(int argc, char* argv[]) {
             while (len > 0 && (input_buffer[len - 1] == '\n' || input_buffer[len - 1] == '\r'))
                 input_buffer[--len] = '\0';
             if (strcmp(input_buffer, "quit") == 0 || strcmp(input_buffer, "exit") == 0) break;
+            if (strcmp(input_buffer, "clear") == 0) {
+                chat_state_init(&chat, show_thinking, reasoning_level);
+                reset_kv_cache(&transformer);
+                fprintf(stderr, "[Conversation cleared]\n\n");
+                continue;
+            }
             if (len == 0) continue;
 
-            // Reset for new turn
+            // Re-process full history each turn (KV cache rebuilt)
             reset_kv_cache(&transformer);
             memset(metrics.expert_hits, 0, sizeof(metrics.expert_hits));
 
-            // Encode prompt
+            // Reset parser state for this turn
+            // Start in PARSE_IN_ROLE because prompt ends with <|start|>assistant
+            chat.parse_state = PARSE_IN_ROLE;
+            chat.current_channel = CHANNEL_NONE;
+            chat.role_buf_len = 0;
+            chat.channel_buf_len = 0;
+            chat.thinking_tokens = 0;
+            chat.response_tokens = 0;
+            chat.analysis_printed_header = 0;
+            chat.thinking_start_ms = 0;
+
+            // Build Harmony-formatted prompt
             int n_prompt;
-            encode(&tokenizer, input_buffer, 0, 0, prompt_tokens, &n_prompt);
+            chat_build_prompt(&chat, &tokenizer, input_buffer, prompt_tokens, &n_prompt);
             metrics.prompt_tokens = n_prompt;
 
-            fprintf(stdout, "GPT-OSS: ");
-            fflush(stdout);
-
-            // Process prompt tokens
+            // Process prompt tokens (prefill)
             metrics.prompt_start_ms = time_in_ms();
             for (int pos = 0; pos < n_prompt; pos++) {
                 forward(&transformer, prompt_tokens[pos], pos, &metrics);
             }
             metrics.prompt_end_ms = time_in_ms();
 
-            // Generate
+            fprintf(stdout, "GPT-OSS: ");
+            fflush(stdout);
+
+            // Generate with Harmony output parsing
             metrics.gen_start_ms = time_in_ms();
             metrics.gen_tokens = 0;
             float* logits = transformer.state.logits;
             int next_token = sample(&sampler, logits, vocab_size);
             int pos = n_prompt;
 
-            while (pos < transformer.config.max_seq_len && metrics.gen_tokens < max_tokens) {
-                if (next_token == eos_id) break;
+            // Track generated tokens for history storage
+            int* gen_tokens = (int*)malloc(transformer.config.max_seq_len * sizeof(int));
+            int n_gen = 0;
 
-                char* piece = decode(&tokenizer, 0, next_token);
-                fprintf(stdout, "%s", piece);
-                fflush(stdout);
+            while (pos < transformer.config.max_seq_len && metrics.gen_tokens < max_tokens) {
+                int should_stop = 0;
+                int should_print = chat_process_token(&chat, &tokenizer, next_token, &should_stop);
+
+                if (n_gen < transformer.config.max_seq_len) {
+                    gen_tokens[n_gen++] = next_token;
+                }
+
+                if (should_stop) break;
+
+                if (should_print) {
+                    char* piece = decode(&tokenizer, 0, next_token);
+                    if (chat.current_channel == CHANNEL_ANALYSIS && chat.show_thinking) {
+                        fprintf(stderr, "%s", piece);  // Thinking goes to stderr
+                    } else {
+                        fprintf(stdout, "%s", piece);   // Response goes to stdout
+                        fflush(stdout);
+                    }
+                }
 
                 logits = forward(&transformer, next_token, pos, &metrics);
                 next_token = sample(&sampler, logits, vocab_size);
@@ -1169,6 +1516,16 @@ int main(int argc, char* argv[]) {
 
             long gen_end = time_in_ms();
             fprintf(stdout, "\n");
+
+            // Store assistant response in history (strip analysis, replace return→end)
+            chat_store_response(&chat, &tokenizer, gen_tokens, n_gen);
+            free(gen_tokens);
+
+            // Print metrics
+            if (chat.thinking_tokens > 0) {
+                fprintf(stderr, "  [%d thinking + %d response tokens]\n",
+                        chat.thinking_tokens, chat.response_tokens);
+            }
             print_metrics(&metrics, gen_end);
             fprintf(stdout, "\n");
         }

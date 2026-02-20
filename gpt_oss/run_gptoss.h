@@ -204,6 +204,72 @@ typedef struct {
 } Metrics;
 
 // ----------------------------------------------------------------------------
+// Harmony chat template (OpenAI's structured response format)
+
+// Special token IDs from o200k_harmony tokenizer
+#define HARM_CHANNEL     200005  // <|channel|>
+#define HARM_START       200006  // <|start|>
+#define HARM_END         200007  // <|end|>
+#define HARM_MESSAGE     200008  // <|message|>
+// Note: <|return|> = 200002 = eos_token_id (already in Config)
+
+typedef enum {
+    CHANNEL_NONE = 0,       // Before any channel identified / fallback
+    CHANNEL_ANALYSIS,       // Chain-of-thought (hidden by default)
+    CHANNEL_COMMENTARY,     // Tool calls (not used in basic chat)
+    CHANNEL_FINAL           // User-facing response
+} HarmonyChannel;
+
+typedef enum {
+    PARSE_CONTENT = 0,      // Inside message content
+    PARSE_SAW_START,        // Saw <|start|>, expect role text
+    PARSE_IN_ROLE,          // Accumulating role text
+    PARSE_SAW_CHANNEL,      // Saw <|channel|>, expect channel name
+    PARSE_IN_CHANNEL_NAME,  // Accumulating channel name
+} HarmonyParseState;
+
+typedef enum {
+    REASONING_LOW = 0,
+    REASONING_MEDIUM = 1,
+    REASONING_HIGH = 2,
+} ReasoningLevel;
+
+#define MAX_HISTORY_TOKENS 3584   // Reserve ~512 for generation
+#define MAX_CHAT_BUF 32           // Buffer for role/channel name
+
+typedef struct {
+    // Conversation history (token IDs)
+    int history[4096];
+    int history_len;
+
+    // Output parser state machine
+    HarmonyParseState parse_state;
+    HarmonyChannel current_channel;
+    char role_buf[MAX_CHAT_BUF];
+    int role_buf_len;
+    char channel_buf[MAX_CHAT_BUF];
+    int channel_buf_len;
+
+    // Settings
+    int show_thinking;
+    ReasoningLevel reasoning_level;
+
+    // Per-turn counters
+    int thinking_tokens;
+    int response_tokens;
+    int analysis_printed_header;
+    long thinking_start_ms;
+} ChatState;
+
+// Chat functions
+void chat_state_init(ChatState* cs, int show_thinking, ReasoningLevel level);
+int  chat_build_prompt(ChatState* cs, Tokenizer* t, const char* user_message,
+                       int* out_tokens, int* n_tokens);
+int  chat_process_token(ChatState* cs, Tokenizer* t, int token, int* should_stop);
+void chat_store_response(ChatState* cs, Tokenizer* t,
+                         const int* gen_tokens, int n_gen);
+
+// ----------------------------------------------------------------------------
 // API functions
 
 // Model loading and cleanup
