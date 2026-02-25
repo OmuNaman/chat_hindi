@@ -13,5 +13,10 @@ chat_history/
 MOBILE_DEPLOYMENT.md
 *.bin
 *.exe
-gpt_oss/raw_bin/
+gpt_oss/
+paper/
+benchmark.py
+benchmark_results.json
+NANO_HINDI_TECHNICAL_DEEP_DIVE.md
+PROJECT_UPDATE.md
 nul
